@@ -1,0 +1,12 @@
+[package]
+name = "pcsleuth-engine"
+description = "Turns source reads into answers: one function per question"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+jiff.workspace = true
+pcsleuth-core.workspace = true
