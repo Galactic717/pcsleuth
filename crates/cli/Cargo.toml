@@ -1,0 +1,20 @@
+[package]
+name = "pcsleuth-cli"
+description = "The pcsleuth command line: ask your Windows PC why it did that"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "pcsleuth"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+jiff.workspace = true
+pcsleuth-core.workspace = true
+pcsleuth-engine.workspace = true
+serde_json.workspace = true

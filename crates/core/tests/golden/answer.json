@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "question": "timeline",
+  "generated_at": "2026-11-03T13:00:00Z",
+  "findings": [
+    {
+      "id": "wake.power_button",
+      "question": "wake",
+      "time": "2026-10-28T14:30:33Z",
+      "headline": "Woke because the power button was pressed",
+      "explanation": "Windows recorded the power button as the wake source.",
+      "confidence": "recorded",
+      "evidence": [
+        {
+          "source": "event_log_system",
+          "record_id": "360285",
+          "timestamp": "2026-10-28T14:30:33Z",
+          "fields": {
+            "WakeSourceType": "1",
+            "event_id": "1",
+            "note": "Привіт",
+            "provider": "Microsoft-Windows-Power-Troubleshooter"
+          }
+        }
+      ],
+      "not_recorded": null,
+      "fix": null
+    },
+    {
+      "id": "wake.hibernate_resume",
+      "question": "wake",
+      "time": "2026-11-03T12:33:08Z",
+      "headline": "Woke from hibernate, cause unknown",
+      "explanation": "Hibernate resume usually reports an unknown source.",
+      "confidence": "correlated",
+      "evidence": [
+        {
+          "source": "event_log_system",
+          "record_id": "364927",
+          "timestamp": "2026-11-03T12:33:08Z",
+          "fields": {
+            "WakeSourceType": "0"
+          }
+        }
+      ],
+      "not_recorded": {
+        "what": "what woke the machine from hibernate",
+        "would_capture": "nothing in Windows; the firmware does not report it"
+      },
+      "fix": null
+    },
+    {
+      "id": "slow.cpu_hog",
+      "question": "slow",
+      "time": null,
+      "headline": "One process used most of the CPU",
+      "explanation": "Seen in 9 of 10 recorder samples, taken 5 seconds apart.",
+      "confidence": "sampled",
+      "evidence": [
+        {
+          "source": "recorder",
+          "record_id": null,
+          "timestamp": null,
+          "fields": {
+            "samples": "9/10"
+          }
+        }
+      ],
+      "not_recorded": null,
+      "fix": null
+    },
+    {
+      "id": "nosleep.past_blockers",
+      "question": "nosleep",
+      "time": null,
+      "headline": "Windows did not record what kept it awake",
+      "explanation": "Past power requests are not logged.",
+      "confidence": "not_recorded",
+      "evidence": [],
+      "not_recorded": {
+        "what": "which program held a power request in the past",
+        "would_capture": "the recorder, or `powercfg /requests` while it is happening"
+      },
+      "fix": {
+        "command": "powercfg /requests",
+        "explanation": "Lists the current power requests and who holds them.",
+        "needs_admin": true
+      }
+    }
+  ],
+  "limits": [
+    {
+      "source": "power_requests",
+      "access": {
+        "kind": "needs_admin"
+      },
+      "adds": "live power requests with their owners"
+    },
+    {
+      "source": "scheduled_tasks",
+      "access": {
+        "kind": "log_disabled"
+      },
+      "adds": null
+    },
+    {
+      "source": "recorder",
+      "access": {
+        "kind": "missing"
+      },
+      "adds": null
+    },
+    {
+      "source": "srum",
+      "access": {
+        "kind": "failed",
+        "code": 31,
+        "message": "A device attached to the system is not functioning."
+      },
+      "adds": null
+    }
+  ]
+}
