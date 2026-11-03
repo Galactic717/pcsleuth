@@ -47,6 +47,8 @@ function Redact-Event([string]$xml) {
         }
         if ($v -match '(?i)\\Users\\') { $n.InnerText = 'X:\REDACTED\RedactedApp.exe'; $private = $true }
     }
+    $company = $doc.SelectSingleNode("//e:EventData/e:Data[@Name='CompanyName']", $ns)
+    if ($company -and $company.InnerText -and $company.InnerText -ne 'Microsoft Corporation') { $private = $true }
     if ($private) {
         foreach ($n in $doc.SelectNodes('//e:EventData/e:Data', $ns)) {
             switch ($n.GetAttribute('Name')) {
@@ -55,6 +57,7 @@ function Redact-Event([string]$xml) {
                 'FileName' { $n.InnerText = 'RedactedApp.exe' }
                 'FriendlyName' { $n.InnerText = 'Redacted App' }
                 'CompanyName' { $n.InnerText = 'Redacted Company' }
+                'ProductName' { $n.InnerText = 'Redacted Product' }
                 'PackageFullName' { $n.InnerText = '' }
                 'PackageRelativeAppId' { $n.InnerText = '' }
             }
