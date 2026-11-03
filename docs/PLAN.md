@@ -59,6 +59,8 @@ Out of scope: macOS, Linux, LLM explanations, anything cloud, localization beyon
 - Readable unelevated: System, Application, Defender, WindowsUpdateClient, Kernel-Boot, Kernel-PnP,
   Resource-Exhaustion-Detector. Denied: Diagnostics-Performance. Disabled here: TaskScheduler. Empty: Thermal.
 - `powercfg /lastwake` said history count 0 even after a real wake, so the log is the source, not that command.
+- Elevated, one read-only capture: Diagnostics-Performance gave events 100, 101, 110, 200, 203 (fixtures). `powercfg
+  /requests` listed process owners and `/waketimers` listed none. `powercfg /srumutil /csv` worked, unlike unelevated.
 
 **First real check.** Record 360285 (28 Oct 2026, 14:30:33 UTC, 16:30 local) must read as a Power Button wake.
 Record 364927 (3 Nov 2026, 12:33:08 UTC, 14:33 local) must read as Unknown, from hibernate. Both are in

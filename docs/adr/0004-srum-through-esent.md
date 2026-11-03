@@ -5,7 +5,9 @@
 ## Context
 
 `SRUDB.dat` is an ESE database locked by a running service, and access is denied without admin. `powercfg /srumutil`
-failed here with 0x1f, cause not established. Per-app energy and IO exist nowhere else.
+failed unelevated with 0x1f and works elevated (13 MB of CSV here), but it covers energy only. Per-app IO and network
+exist nowhere else. An `esentutl /vss` copy on this laptop reports `Dirty Shutdown`, so log replay on the copy is
+required.
 
 ## Decision
 
@@ -16,7 +18,8 @@ the copy is dirty, then read it with the ESENT API in `Win32_Storage_Jet` opened
 
 - **Pure Rust ESE parser or libesedb bindings**: runs off Windows, which we do not need, and adds third-party code
   parsing a complex format. `esent.dll` ships with every target and always matches the format.
-- **`powercfg /srumutil /csv`**: failed on the only machine tested, and its column set is undocumented.
+- **`powercfg /srumutil /csv`**: elevated only, energy only, undocumented columns. Useful as a cross-check of what the
+  ESE reader returns, not as the source.
 
 ## Consequences
 
