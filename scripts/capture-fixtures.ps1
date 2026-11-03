@@ -41,7 +41,7 @@ function Redact-Event([string]$xml) {
     $private = $false
     foreach ($n in $doc.SelectNodes('//e:EventData/e:Data', $ns)) {
         $v = $n.InnerText
-        if ($v -match '^[A-Za-z]:\\' -and $v -notmatch '^(?i)C:\\(Windows|ProgramData\\Microsoft)\\') {
+        if ($v -match '^"?[A-Za-z]:\\' -and $v -notmatch '^"?(?i)C:\\(Windows|ProgramData\\Microsoft)\\') {
             $n.InnerText = 'X:\REDACTED\RedactedApp.exe'
             $private = $true
         }
@@ -51,6 +51,10 @@ function Redact-Event([string]$xml) {
         foreach ($n in $doc.SelectNodes('//e:EventData/e:Data', $ns)) {
             switch ($n.GetAttribute('Name')) {
                 'AppName' { $n.InnerText = 'RedactedApp.exe' }
+                'Name' { $n.InnerText = 'RedactedApp.exe' }
+                'FileName' { $n.InnerText = 'RedactedApp.exe' }
+                'FriendlyName' { $n.InnerText = 'Redacted App' }
+                'CompanyName' { $n.InnerText = 'Redacted Company' }
                 'PackageFullName' { $n.InnerText = '' }
                 'PackageRelativeAppId' { $n.InnerText = '' }
             }
