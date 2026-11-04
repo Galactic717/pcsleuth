@@ -542,28 +542,239 @@ mod tests {
         }
     }
 
-    /// Run by hand, elevated: `cargo test -p pcsleuth-sources -- --ignored --nocapture
-    /// elevated_power_requests`. Compare the output with `powercfg /requests`.
+    // The tests below set one wake timer and hold one power request in this test process, so the
+    // elevated reads have something with a known owner, reason and time to find. Neither can put
+    // the machine to sleep or wake it: the timer is two years out and is cancelled at once, and the
+    // request is an EXECUTION request, which only affects process lifetime management.
+
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Power::{
+        PowerClearRequest, PowerCreateRequest, PowerRequestExecutionRequired, PowerSetRequest,
+    };
+    use windows::Win32::System::Threading::{
+        CancelWaitableTimer, CreateWaitableTimerW, POWER_REQUEST_CONTEXT_SIMPLE_STRING,
+        REASON_CONTEXT, REASON_CONTEXT_0, SetWaitableTimerEx,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    use super::super::{Reason, RequestType, Requester};
+
+    /// A `REASON_CONTEXT` with a simple string. `text` must outlive the context.
+    fn simple_reason(text: &mut Vec<u16>) -> REASON_CONTEXT {
+        REASON_CONTEXT {
+            Version: 0,
+            Flags: POWER_REQUEST_CONTEXT_SIMPLE_STRING,
+            Reason: REASON_CONTEXT_0 {
+                SimpleReasonString: PWSTR(text.as_mut_ptr()),
+            },
+        }
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// A resume timer set for `due`, cancelled and closed when dropped.
+    struct ArmedTimer {
+        handle: HANDLE,
+        due: Timestamp,
+    }
+
+    impl ArmedTimer {
+        fn arm(reason: &str) -> windows::core::Result<ArmedTimer> {
+            // SAFETY: an unnamed manual-reset timer with default security.
+            let handle = unsafe { CreateWaitableTimerW(None, true, PCWSTR::null()) }?;
+            let due = Timestamp::now()
+                .checked_add(jiff::SignedDuration::from_hours(24 * 730))
+                .expect("two years out is in range");
+            // A positive due time is an absolute FILETIME.
+            let ticks = due.as_microsecond() * 10 + 116_444_736_000_000_000;
+            let mut text = wide(reason);
+            let context = simple_reason(&mut text);
+            // SAFETY: `ticks` and `context` (and the string it points to) outlive the call, and
+            // `handle` is the timer made above. The reason context makes it a resume timer.
+            let set =
+                unsafe { SetWaitableTimerEx(handle, &ticks, 0, None, None, Some(&context), 0) };
+            let timer = ArmedTimer { handle, due };
+            set.map(|()| timer)
+        }
+    }
+
+    impl Drop for ArmedTimer {
+        fn drop(&mut self) {
+            // SAFETY: `handle` is the timer this value owns, cancelled and closed once.
+            unsafe {
+                let _ = CancelWaitableTimer(self.handle);
+                let _ = CloseHandle(self.handle);
+            }
+        }
+    }
+
+    /// An EXECUTION power request held with a known reason, cleared and closed when dropped.
+    struct HeldRequest(HANDLE);
+
+    impl HeldRequest {
+        fn hold(reason: &str) -> windows::core::Result<HeldRequest> {
+            let mut text = wide(reason);
+            let context = simple_reason(&mut text);
+            // SAFETY: `context` and its string outlive the call.
+            let handle = unsafe { PowerCreateRequest(&context) }?;
+            let held = HeldRequest(handle);
+            // SAFETY: `handle` is the request made above.
+            unsafe { PowerSetRequest(handle, PowerRequestExecutionRequired) }?;
+            Ok(held)
+        }
+    }
+
+    impl Drop for HeldRequest {
+        fn drop(&mut self) {
+            // SAFETY: the request is cleared and closed once.
+            unsafe {
+                let _ = PowerClearRequest(self.0, PowerRequestExecutionRequired);
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn owner_pid(owner: &Requester) -> Option<u32> {
+        match owner {
+            Requester::Process { pid, .. } | Requester::Service { pid, .. } => Some(*pid),
+            _ => None,
+        }
+    }
+
+    /// The owner is this test executable: the native path ends with its file name.
+    fn is_this_executable(owner: &Requester) -> bool {
+        let me = std::env::current_exe().unwrap();
+        let me = me.file_name().unwrap().to_string_lossy().to_lowercase();
+        match owner {
+            Requester::Process {
+                image: Some(image), ..
+            } => image.to_lowercase().ends_with(&me),
+            _ => false,
+        }
+    }
+
+    /// Runs unelevated too, so a mistake in the helpers shows up in a normal test run: the helpers
+    /// work, and the two admin-only reads still say `NeedsAdmin` while a timer and a request exist.
+    #[test]
+    fn the_test_helpers_arm_a_timer_and_hold_a_request() {
+        let me = std::process::id();
+        let timer = match ArmedTimer::arm(&format!("pcsleuth test timer {me}")) {
+            Ok(timer) => Some(timer),
+            // A machine or VM without resume timer support says so; nothing else is acceptable.
+            Err(e) if e.code().0 as u32 == 0x8007_0032 => {
+                eprintln!("resume timers are not supported here, so no timer was armed");
+                None
+            }
+            Err(e) => panic!("arming the test timer failed: {e}"),
+        };
+        let request = HeldRequest::hold(&format!("pcsleuth test request {me}")).unwrap();
+        if !is_elevated() {
+            assert_eq!(wake_timers().access, Access::NeedsAdmin);
+            assert_eq!(power_requests().access, Access::NeedsAdmin);
+        }
+        drop(request);
+        drop(timer);
+    }
+
+    /// Run by hand, elevated, with the owner's permission: `cargo test -p pcsleuth-sources --
+    /// --ignored --nocapture elevated_power_requests`. It holds a request in this process with a
+    /// known reason and checks the read finds it with the right owner, mode and reason, and that it
+    /// is gone once cleared. Compare the printed list with `powercfg /requests`.
     #[test]
     #[ignore = "needs an elevated shell; the owner runs it"]
     fn elevated_power_requests() {
         assert!(is_elevated(), "run this test from an elevated shell");
+        let me = std::process::id();
+        let reason = format!("pcsleuth elevated test request {me}");
+        let request = HeldRequest::hold(&reason).expect("could not hold a request");
+
         let read = power_requests();
-        eprintln!("{:#?}", read);
+        eprintln!("{read:#?}");
         assert_eq!(read.access, Access::Ok);
-        for request in &read.data {
-            assert!(!request.active.is_empty());
-        }
+        assert!(read.data.iter().all(|r| !r.active.is_empty()));
+        let mine: Vec<_> = read
+            .data
+            .iter()
+            .filter(|r| owner_pid(&r.requester) == Some(me))
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "expected exactly one request from this process"
+        );
+        let found = mine[0];
+        assert!(
+            is_this_executable(&found.requester),
+            "{:?}",
+            found.requester
+        );
+        assert!(matches!(found.requester, Requester::Process { .. }));
+        assert_eq!(found.active, vec![(RequestType::Execution, 1)]);
+        assert_eq!(found.reason, Some(Reason::Text(reason)));
+
+        drop(request);
+        let after = power_requests();
+        assert_eq!(after.access, Access::Ok);
+        assert!(
+            after
+                .data
+                .iter()
+                .all(|r| owner_pid(&r.requester) != Some(me)),
+            "a cleared request must not be listed: {after:#?}"
+        );
     }
 
-    /// Run by hand, elevated. Compare with `powercfg /waketimers`. An empty list passes; a layout
-    /// error does not.
+    /// Run by hand, elevated, with the owner's permission: `cargo test -p pcsleuth-sources --
+    /// --ignored --nocapture elevated_wake_timers`. It sets a resume timer two years out in this
+    /// process and checks the read finds it with the right owner, due time and period, and that it
+    /// is gone once cancelled. This is what confirms the entry layout and that the due time is a
+    /// `FILETIME`, which an empty machine could not. Compare with `powercfg /waketimers`.
     #[test]
     #[ignore = "needs an elevated shell; the owner runs it"]
     fn elevated_wake_timers() {
         assert!(is_elevated(), "run this test from an elevated shell");
+        let me = std::process::id();
+        let reason = format!("pcsleuth elevated test timer {me}");
+        let timer = ArmedTimer::arm(&reason).expect("could not arm a resume timer");
+
         let read = wake_timers();
-        eprintln!("{:#?}", read);
+        eprintln!("{read:#?}");
         assert_eq!(read.access, Access::Ok);
+        let mine: Vec<_> = read
+            .data
+            .iter()
+            .filter(|t| owner_pid(&t.owner) == Some(me))
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "expected exactly one timer from this process"
+        );
+        let found = mine[0];
+        assert!(is_this_executable(&found.owner), "{:?}", found.owner);
+        assert_eq!(found.period_ms, 0);
+        let due = found
+            .due
+            .expect("the due time must read as an absolute time");
+        let off = (due.as_microsecond() - timer.due.as_microsecond()).abs();
+        assert!(
+            off < 2_000_000,
+            "due time is {off} microseconds from the one that was set"
+        );
+        // The reason is not guaranteed to be carried through for a timer; if it is, it must match.
+        match &found.reason {
+            Some(shown) => assert_eq!(shown, &Reason::Text(reason)),
+            None => eprintln!("note: the timer was listed without its reason"),
+        }
+
+        drop(timer);
+        let after = wake_timers();
+        assert_eq!(after.access, Access::Ok);
+        assert!(
+            after.data.iter().all(|t| owner_pid(&t.owner) != Some(me)),
+            "a cancelled timer must not be listed: {after:#?}"
+        );
     }
 }

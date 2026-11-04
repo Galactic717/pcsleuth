@@ -9,7 +9,9 @@
 //! - [`execution_state`], [`last_input`], [`power_source`]: what the machine is doing now.
 //! - [`armed_devices`]: devices allowed to wake the machine.
 //! - [`power_requests`], [`wake_timers`]: live, owner-attributed, admin only.
-//! - [`is_elevated`], [`relaunch_elevated`]: ADR 0003.
+//! - [`is_elevated`], [`create_output_dir`], [`relaunch_elevated`], [`open_output_file`]: ADR 0003.
+//!   Read the `elevate` module notes on the output file before wiring `--elevate`.
+//! - [`system_directory`]: where to find a system executable that may run elevated.
 
 mod elevate;
 mod layout;
