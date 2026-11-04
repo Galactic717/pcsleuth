@@ -47,9 +47,10 @@ These are `pcsleuth_core::RecorderRow` values, built from `processes::sample` an
 `power::power_requests`, the same sources `now` uses.
 
 **Power requests need admin.** Without it `power_requests` returns `NeedsAdmin`. The row is still written, with
-`requests_visible = false`, so a reader never takes an empty list for "none held". `RecorderRow` has no field for this,
-so the ring keeps it next to the row (`Sample`) and `read_rows` reports it through `Access::Partial` (see
-[API](#library-api)).
+`requests_visible = false` (a field of `RecorderRow`), so a reader never takes an empty list for "none held". Such a row
+is still a good sample of CPU and IO, so reading it is `Access::Ok`. The engine's `nosleep` counts only rows that could
+see requests, and when none could it says "could not see power requests in any of them. That says nothing about what was
+held" and that the recorder needs to run as admin.
 
 `interval_secs` in a row is the span the rates really cover, not the configured interval. If the machine slept between
 two ticks the span is long and the rates are averages over it; a finding built from such a row must say so. Anything
@@ -104,15 +105,15 @@ reach), a second recorder cannot open the same ring, and readers such as `status
 | Function | Returns |
 |---|---|
 | `default_ring_path()` | the service's ring if it is there (also when this user may not look at it, which then reads as `NeedsAdmin`, not `Missing`), else the user's. `service_ring_path()` and `user_ring_path()` give each |
-| `read_rows(path, since)` | `Sourced<RecorderRow>`, oldest first, rows at or after `since` |
-| `read_samples(path, since)` | `Sourced<Sample>`: the same rows with `requests_visible` and `truncated` |
+| `read_rows(path, since)` | `Sourced<RecorderRow>`, oldest first, rows at or after `since`. The only reader; each row carries `requests_visible` |
 | `status(path)` | `Sourced<Status>`: size, slots, interval, rows, skipped, oldest, newest, how many rows lack request visibility, and `newest_age(now)` / `looks_stopped(now)` (the newest row is older than three intervals and a minute, so the recorder is probably not running, or the machine slept) |
 
 No ring file is `Access::Missing` and a folder the caller cannot read is `Access::NeedsAdmin`, never an error. Damaged
-slots give `Access::Partial` with their count. `read_rows` also gives `Partial` when some rows were recorded without
-admin, because `RecorderRow` cannot carry that per row. **The engine should use `read_samples` for `nosleep`**, where an
-empty `power_requests` in a row with `requests_visible == false` must never be read as "nothing held". A follow-up in
-`pcsleuth-core` could add `requests_visible` to `RecorderRow` and make `read_samples` unnecessary.
+slots give `Access::Partial` with their count. Rows recorded without admin do **not** make a read partial: each says in
+`requests_visible` that its empty `power_requests` means "not visible", and whoever reads power requests must check it.
+
+The engine reads the ring in its gather step (`pcsleuth_recorder::read_rows(&default_ring_path(), since)`), for `nosleep`
+and `slow`, and `doctor` reports the recorder's access from the same read.
 
 ## Who can read the ring
 
@@ -279,6 +280,13 @@ Written without administrator rights and without installing anything, so the ser
   with exit code 0, `status` and `read_rows` read back what it wrote, rows said power requests were not visible, and the
   file was exactly 16 777 216 bytes.
 - `--measure`, as above.
+- Through the engine, with a ring from a real `--foreground` run (6 rows at a 2 s interval, unelevated, process ended
+  with `Stop-Process`): `pcsleuth nosleep --since 1h` read it and said the recorder "took 6 recorder samples in this
+  period, but it was not running as admin, so it could not see power requests in any of them. That says nothing about
+  what was held", with "the pcsleuth recorder running as admin (the installed service does)" as what would capture it;
+  `pcsleuth doctor` showed the recorder as readable. With no ring it said the recorder was missing. A Sampled finding
+  from the recorder needs rows that could see requests (an elevated recorder); the engine tests cover that path with
+  built rows, not a real elevated recording.
 
 **Not verified, because it needs administrator rights:**
 
