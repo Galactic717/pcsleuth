@@ -289,6 +289,7 @@ fn row(at: &str, cpu: &[(&str, u32)], io: &[(&str, u64)]) -> RecorderRow {
         top_cpu: cpu.iter().map(|(n, c)| process(n, *c, 0)).collect(),
         top_io: io.iter().map(|(n, b)| process(n, 0, *b)).collect(),
         power_requests: vec![],
+        requests_visible: true,
     }
 }
 

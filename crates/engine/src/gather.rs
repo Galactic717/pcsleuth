@@ -182,11 +182,14 @@ fn srum(w: &Window) -> Sourced<AppUsage> {
     })
 }
 
-/// The recorder's ring file is not read yet.
-// ponytail: the lead wires the real reader after the recorder package merges. Until then the
-// recorder is reported missing, which is also what a PC that never turned it on gets.
-fn recorder() -> Sourced<pcsleuth_core::RecorderRow> {
-    Sourced::unreadable(SourceId::Recorder, Access::Missing)
+/// The recorder's rows in the window, from the service's ring if there is one, else the one
+/// `--foreground` made. No ring is `Missing`, which is also what a PC that never turned the
+/// recorder on gets. A ring this user may not open is `NeedsAdmin`, not `Missing`.
+fn recorder(w: &Window) -> Sourced<pcsleuth_core::RecorderRow> {
+    read!(
+        SourceId::Recorder,
+        pcsleuth_recorder::read_rows(&pcsleuth_recorder::default_ring_path(), w.since)
+    )
 }
 
 pub fn wake_input(w: &Window) -> wake::Input {
@@ -206,7 +209,7 @@ pub fn nosleep_input(w: &Window) -> nosleep::Input {
         execution_state: execution_state(),
         last_input: last_input(),
         wakes: wakes(w),
-        recorder: recorder(),
+        recorder: recorder(w),
     }
 }
 
@@ -232,7 +235,7 @@ pub fn slow_input(w: &Window) -> slow::Input {
         processor_caps: processor_caps(w),
         resource: resource(w),
         srum: srum(w),
-        recorder: recorder(),
+        recorder: recorder(w),
     }
 }
 
@@ -316,7 +319,7 @@ pub fn doctor_input(w: &Window) -> doctor::Input {
                 SourceId::Srum => srum(w).access,
                 SourceId::ScheduledTasks => wake_tasks().access,
                 SourceId::Processes => process_sample().access,
-                SourceId::Recorder => recorder().access,
+                SourceId::Recorder => recorder(w).access,
             };
             let log = (source == SourceId::ScheduledTasks).then(|| channel_status(source));
             doctor::Probe {

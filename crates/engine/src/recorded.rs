@@ -34,6 +34,25 @@ fn watched(rows: &[&RecorderRow]) -> String {
     )
 }
 
+/// How many rows could see power requests. A row recorded without admin has an empty list that
+/// means "not visible", so it counts for nothing here, either way.
+pub fn seeing_requests(rows: &[&RecorderRow]) -> usize {
+    rows.iter().filter(|row| row.requests_visible).count()
+}
+
+/// A sentence for the rows that could not see power requests, or nothing when there are none.
+fn blind_note(rows: &[&RecorderRow]) -> String {
+    let blind = rows.len() - seeing_requests(rows);
+    if blind == 0 {
+        return String::new();
+    }
+    format!(
+        " {blind} of the {} samples could not see power requests because the recorder was not \
+         running as admin, so a blocker held during those would not show here.",
+        rows.len()
+    )
+}
+
 fn kind_label(kind: &str) -> String {
     match kind {
         "away_mode" => "away mode".into(),
@@ -51,7 +70,8 @@ struct Seen {
 /// Power requests the recorder saw, grouped by owner and kind. Returns whether it made any.
 pub fn request_findings(rows: &[&RecorderRow], out: &mut Findings) -> bool {
     let mut groups: BTreeMap<(&str, &str), Seen> = BTreeMap::new();
-    for row in rows {
+    // Only samples that could see requests can say one was held, or count as one that looked.
+    for row in rows.iter().filter(|row| row.requests_visible) {
         for request in &row.power_requests {
             let seen = groups
                 .entry((request.owner.as_str(), request.kind.as_str()))
@@ -69,7 +89,7 @@ pub fn request_findings(rows: &[&RecorderRow], out: &mut Findings) -> bool {
             }
         }
     }
-    let total = rows.len();
+    let total = seeing_requests(rows);
     let made = !groups.is_empty();
     for ((owner, kind), seen) in groups {
         let mut evidence = pcsleuth_core::Evidence::new(SourceId::Recorder)
@@ -104,7 +124,7 @@ pub fn request_findings(rows: &[&RecorderRow], out: &mut Findings) -> bool {
                     kind_label(kind),
                     seen.count
                 ),
-                format!("{}{reason}", watched(rows)),
+                format!("{}{reason}{}", watched(rows), blind_note(rows)),
                 [evidence],
             )
             .map(|f| f.at(seen.last)),

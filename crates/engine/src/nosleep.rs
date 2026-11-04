@@ -43,7 +43,7 @@ pub fn answer(input: &Input, window: &Window) -> Answer {
 
     let rows = recorded::rows_in_window(&input.recorder, window);
     if !recorded::request_findings(&rows, &mut out) {
-        past_blockers(rows.len(), &mut out);
+        past_blockers(&rows, &mut out);
     }
     finish(Question::NoSleep, window, out.0, limits)
 }
@@ -184,16 +184,45 @@ fn last_sleep_finding(
     ));
 }
 
-fn past_blockers(samples: usize, out: &mut Findings) {
-    let seen = if samples > 0 {
+/// What the recorder's samples in the period do and do not show about past power requests. A
+/// sample recorded without admin could not see requests at all, so it is never read as "none".
+fn past_blockers(rows: &[&RecorderRow], out: &mut Findings) {
+    let taken = rows.len();
+    let looked = recorded::seeing_requests(rows);
+    let plural = |n: usize| if n == 1 { "sample" } else { "samples" };
+    let seen = if taken == 0 {
+        String::new()
+    } else if looked == 0 {
         format!(
-            " The recorder took {samples} recorder {} in this period but none showed a power \
-             request. It sees owners only when it runs as admin and can miss anything shorter \
-             than its interval, so that does not prove none was held.",
-            if samples == 1 { "sample" } else { "samples" }
+            " The recorder took {taken} recorder {} in this period, but it was not running as \
+             admin, so it could not see power requests in any of them. That says nothing about \
+             what was held.",
+            plural(taken)
         )
     } else {
-        String::new()
+        let blind = if looked < taken {
+            format!(
+                " The other {} could not see power requests because the recorder was not running \
+                 as admin.",
+                taken - looked
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            " The recorder looked at power requests in {looked} of {taken} recorder {} in this \
+             period and none showed one.{blind} It can miss anything shorter than its interval, \
+             so that does not prove none was held.",
+            plural(taken)
+        )
+    };
+    let can_see = if taken > 0 && looked < taken {
+        "the pcsleuth recorder running as admin (the installed service does), which samples \
+         power requests every few seconds, or pcsleuth nosleep --elevate while the problem is \
+         happening"
+    } else {
+        "the pcsleuth recorder (opt-in), which samples power requests every few seconds, or \
+         pcsleuth nosleep --elevate while the problem is happening"
     };
     out.push(Finding::not_recorded(
         "nosleep.past_blockers",
@@ -204,10 +233,6 @@ fn past_blockers(samples: usize, out: &mut Findings) {
              only while it is active and keeps no history of them. That is why pcsleuth can name a blocker that is holding right now (admin needed) or \
              one the recorder saw, and nothing earlier.{seen}"
         ),
-        NotRecorded::new(
-            "which program or driver held the PC awake earlier",
-            "the pcsleuth recorder (opt-in), which samples power requests every few seconds, or \
-             pcsleuth nosleep --elevate while the problem is happening",
-        ),
+        NotRecorded::new("which program or driver held the PC awake earlier", can_see),
     ));
 }

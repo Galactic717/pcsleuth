@@ -260,6 +260,7 @@ version = "0.1.0"
 dependencies = [
  "jiff",
  "pcsleuth-core",
+ "pcsleuth-recorder",
  "pcsleuth-sources",
 ]
 

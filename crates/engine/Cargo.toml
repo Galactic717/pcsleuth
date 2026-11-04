@@ -10,4 +10,7 @@ publish.workspace = true
 [dependencies]
 jiff.workspace = true
 pcsleuth-core.workspace = true
+# Not a workspace dependency: that list is core's to change. The recorder depends on core and
+# sources only, so the engine can read its ring without a cycle.
+pcsleuth-recorder = { path = "../recorder" }
 pcsleuth-sources.workspace = true
