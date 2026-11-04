@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn another_provider_with_the_same_event_id_is_skipped() {
-        let xml = "<Event xmlns='x'><System><Provider Name='CodexSandboxService.OpenAI.Codex'/>\
+        let xml = "<Event xmlns='x'><System><Provider Name='ExampleService.Vendor.App'/>\
                    <EventID Qualifiers='0'>1000</EventID>\
                    <TimeCreated SystemTime='2026-11-03T16:31:25.2548864Z'/>\
                    <EventRecordID>172266</EventRecordID></System>\
