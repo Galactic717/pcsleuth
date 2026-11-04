@@ -22,6 +22,7 @@ features = [
     "Win32_System_EventLog",
     "Win32_System_Power",
     "Win32_Storage_Jet",
+    "Win32_Storage_StructuredStorage",
     "Win32_Storage_FileSystem",
     "Win32_System_TaskScheduler",
     "Win32_System_Com",
