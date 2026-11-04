@@ -264,6 +264,15 @@ dependencies = [
 [[package]]
 name = "pcsleuth-eval"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "jiff",
+ "pcsleuth-core",
+ "serde",
+ "serde_json",
+ "windows",
+]
 
 [[package]]
 name = "pcsleuth-recorder"
