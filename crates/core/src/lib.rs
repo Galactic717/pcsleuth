@@ -8,11 +8,13 @@
 
 mod answer;
 mod finding;
+mod recorder;
 mod source;
 mod timeline;
 
 pub use answer::{Answer, Question, SCHEMA_VERSION};
 pub use finding::{Confidence, Evidence, Finding, FindingError, Fix, NotRecorded};
 pub use jiff::Timestamp;
+pub use recorder::{RecordedProcess, RecordedRequest, RecorderRow};
 pub use source::{Access, Limit, SourceId, Sourced};
 pub use timeline::merge_timeline;
