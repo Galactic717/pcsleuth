@@ -4,9 +4,9 @@
     "tag": "laptop",
     "elevated": false,
     "os_build": "10.0.26300",
-    "git_commit": "cb1e52204688",
+    "git_commit": "72e8a448d04b",
     "git_dirty": false,
-    "date": "2026-11-04T00:12:31.6978354Z"
+    "date": "2026-11-04T00:16:13.0564553Z"
   },
   "summary": {
     "true_positive": 0,
@@ -37,7 +37,7 @@
       "extras": 0,
       "placeholder": true,
       "injected_record_ids": [
-        "173025"
+        "173040"
       ]
     },
     {
@@ -52,7 +52,7 @@
       "extras": 0,
       "placeholder": true,
       "injected_record_ids": [
-        "173030"
+        "173043"
       ]
     },
     {

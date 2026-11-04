@@ -202,14 +202,14 @@ This is the starting line, not an achievement. The engine is the stub from the c
 returns one `*.not_implemented` not-recorded finding.
 
 - **Where**: the author's laptop (`laptop`), Windows 11 build `10.0.26300`, **not elevated**.
-- **When and what**: 2026-11-04T00:12:31Z, commit `cb1e52204688`, clean tree. File:
+- **When and what**: 2026-11-04T00:16:13Z, commit `72e8a448d04b`, clean tree. File:
   [`eval/results/baseline-before-engine-laptop.json`](../eval/results/baseline-before-engine-laptop.json).
 - **Command**: `cargo run -p pcsleuth-eval -- run`.
 
 | Scenario | Observable | Result |
 |---|---|---|
-| `crash-app-error` | yes | miss (event 173025 was injected and written) |
-| `hang-app-hang` | yes | miss (event 173030 was injected and written) |
+| `crash-app-error` | yes | miss (event 173040 was injected and written) |
+| `hang-app-hang` | yes | miss (event 173043 was injected and written) |
 | `cpu-hog-live` | yes | miss |
 | `disk-hog-live` | yes | miss |
 | `power-request-live` | no (unelevated) | honest, by placeholder |
