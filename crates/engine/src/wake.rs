@@ -18,7 +18,7 @@ use pcsleuth_sources::tasks::{TaskScan, TaskState};
 
 use crate::common::{
     Findings, Limits, Window, between, collapse_sids, duration, exe_name, file_name, finish, fix,
-    live, not_recorded_citing, quote_for_shell, stamped,
+    live, quote_for_shell, stamped,
 };
 
 /// What the question reads. Every source is read on its own, so one that fails costs only itself.
@@ -349,14 +349,14 @@ fn unknown_finding(
         )
     };
     let _ = wake;
-    not_recorded_citing(
+    Finding::not_recorded(
         "wake.unknown_source",
         Question::Wake,
         format!("{}: Windows did not record what woke it", kind.woke_from()),
         explanation,
         gap,
-        evidence,
     )
+    .map(|finding| finding.with_evidence(evidence))
 }
 
 fn standby_finding(

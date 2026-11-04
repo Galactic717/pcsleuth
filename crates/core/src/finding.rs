@@ -347,6 +347,15 @@ impl Finding {
         Ok(self)
     }
 
+    /// Cite more records. This is how a `not recorded` finding keeps the record that shows the
+    /// gap, such as a wake whose log entry lists no source: the confidence stays `NotRecorded` and
+    /// the gap note stays required. Evidence added here never names a cause for a scorer, because
+    /// a not recorded finding is not confident.
+    pub fn with_evidence(mut self, evidence: impl IntoIterator<Item = Evidence>) -> Self {
+        self.evidence.extend(evidence);
+        self
+    }
+
     /// Stable id such as `wake.power_button`. Tests and the app key on it.
     pub fn id(&self) -> &str {
         &self.id
@@ -473,6 +482,40 @@ mod tests {
             finding.with_gap(NotRecorded::new("x", "")),
             Err(FindingError::Blank("not_recorded.would_capture"))
         );
+    }
+
+    #[test]
+    fn a_not_recorded_finding_can_cite_the_record_that_shows_the_gap() {
+        let plain = Finding::not_recorded("n", Question::Wake, "h", "x", gap()).unwrap();
+        assert!(plain.evidence().is_empty());
+
+        let cited = plain.with_evidence([evidence()]);
+        // Still not recorded, still carrying its gap note, now with the record.
+        assert_eq!(cited.confidence(), Confidence::NotRecorded);
+        assert_eq!(cited.gap(), Some(&gap()));
+        assert_eq!(cited.evidence(), [evidence()]);
+
+        // It survives the JSON round trip, and the checks on the wire form still pass.
+        let json = serde_json::to_value(&cited).unwrap();
+        assert_eq!(serde_json::from_value::<Finding>(json).unwrap(), cited);
+    }
+
+    #[test]
+    fn citing_more_records_never_removes_what_a_confidence_requires() {
+        let recorded = Finding::recorded("a", Question::Wake, "h", "x", [evidence()])
+            .unwrap()
+            .with_evidence([evidence().with_record_id("2")]);
+        assert_eq!(recorded.evidence().len(), 2);
+        assert_eq!(recorded.confidence(), Confidence::Recorded);
+        // Dropping the gap note from a not recorded finding on the wire is still refused.
+        let mut json = serde_json::to_value(
+            Finding::not_recorded("n", Question::Wake, "h", "x", gap())
+                .unwrap()
+                .with_evidence([evidence()]),
+        )
+        .unwrap();
+        json["not_recorded"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<Finding>(json).is_err());
     }
 
     #[test]

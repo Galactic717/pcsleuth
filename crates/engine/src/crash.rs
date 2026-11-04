@@ -16,7 +16,7 @@ use pcsleuth_sources::eventlog::{
     ShutdownInitiated, UncleanReboot, UnexpectedShutdown, WerReport,
 };
 
-use crate::common::{Findings, Limits, Window, finish, not_recorded_citing, stamped};
+use crate::common::{Findings, Limits, Window, finish, stamped};
 
 pub struct Input {
     pub applications: Sourced<ApplicationEvent>,
@@ -491,10 +491,10 @@ fn restart_finding(group: &[&Piece], window: &Window) -> Result<Finding, Finding
     } else {
         format!(" and recorded {}", empty.join(" and "))
     };
-    not_recorded_citing(
+    Finding::not_recorded(
         "crash.power_lost",
         Question::Crash,
-        "The PC lost power or stopped completely, and Windows does not know why".into(),
+        "The PC lost power or stopped completely, and Windows does not know why",
         format!(
             "Windows found that the PC had not shut down cleanly (Kernel-Power event 41, EventLog \
              event 6008){absent}. Possible reasons include a power cut, a flat battery, a hard \
@@ -505,9 +505,8 @@ fn restart_finding(group: &[&Piece], window: &Window) -> Result<Finding, Finding
             "Windows keeps nothing more after the fact. The pcsleuth recorder (opt-in) shows what \
              the PC was doing just before the next time this happens.",
         ),
-        evidence,
     )
-    .map(at)
+    .map(|finding| at(finding.with_evidence(evidence)))
 }
 
 /// One finding per program that asked for a shutdown or restart, with how many times. A busy PC

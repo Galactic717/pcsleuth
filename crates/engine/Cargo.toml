@@ -11,5 +11,3 @@ publish.workspace = true
 jiff.workspace = true
 pcsleuth-core.workspace = true
 pcsleuth-sources.workspace = true
-# Builds the one finding shape core has no constructor for (not recorded, but citing its record).
-serde_json.workspace = true

@@ -261,7 +261,6 @@ dependencies = [
  "jiff",
  "pcsleuth-core",
  "pcsleuth-sources",
- "serde_json",
 ]
 
 [[package]]

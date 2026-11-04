@@ -5,8 +5,7 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use pcsleuth_core::{
-    Answer, Evidence, Finding, FindingError, Fix, Limit, NotRecorded, Question, SourceId, Sourced,
-    merge_timeline,
+    Answer, Evidence, Finding, Fix, Limit, Question, SourceId, Sourced, merge_timeline,
 };
 use pcsleuth_sources::eventlog::Meta;
 
@@ -203,36 +202,6 @@ fn left_out_note(
     }
 }
 
-/// A finding that is `not recorded` and still cites the record that shows the gap.
-///
-/// Core has no constructor for this shape: `Finding::not_recorded` takes no evidence, and the
-/// other constructors set another confidence. Its validating deserializer accepts it, so the
-/// finding is built through that and gets the same checks as any other.
-pub fn not_recorded_citing(
-    id: &str,
-    question: Question,
-    headline: String,
-    explanation: String,
-    gap: NotRecorded,
-    evidence: Vec<Evidence>,
-) -> Result<Finding, FindingError> {
-    // Core's own constructor runs the checks first, so a refusal carries core's reason.
-    Finding::not_recorded(id, question, &headline, &explanation, gap.clone())?;
-    serde_json::from_value(serde_json::json!({
-        "id": id,
-        "question": question,
-        "time": null,
-        "headline": headline,
-        "explanation": explanation,
-        "confidence": "not_recorded",
-        "evidence": evidence,
-        "not_recorded": gap,
-        "fix": null,
-    }))
-    // Unreachable once the checks above passed: every part serializes.
-    .map_err(|_| FindingError::Blank("not recorded finding"))
-}
-
 /// `base` with the record id and time of `meta` filled in when the source left them out.
 pub fn stamped(mut base: Evidence, meta: &Meta) -> Evidence {
     if base.record_id.is_none() {
@@ -362,6 +331,8 @@ pub fn quote_for_shell(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use pcsleuth_core::NotRecorded;
+
     use super::*;
 
     #[test]
@@ -581,32 +552,5 @@ mod tests {
         assert!(!window.contains(None));
         assert!(window.contains(Some("2026-11-01T00:00:00Z".parse().unwrap())));
         assert!(!window.contains(Some("2026-10-31T23:59:59Z".parse().unwrap())));
-    }
-
-    #[test]
-    fn a_not_recorded_finding_can_cite_its_record() {
-        let finding = not_recorded_citing(
-            "x.y",
-            Question::Crash,
-            "headline".into(),
-            "text".into(),
-            NotRecorded::new("what", "capture"),
-            vec![Evidence::new(SourceId::EventLogSystem).with_record_id("7")],
-        )
-        .unwrap();
-        assert_eq!(finding.confidence(), pcsleuth_core::Confidence::NotRecorded);
-        assert_eq!(finding.evidence()[0].record_id.as_deref(), Some("7"));
-        // The same checks as any other finding: a blank headline is refused.
-        assert_eq!(
-            not_recorded_citing(
-                "x.y",
-                Question::Crash,
-                " ".into(),
-                "text".into(),
-                NotRecorded::new("what", "capture"),
-                vec![],
-            ),
-            Err(FindingError::Blank("headline"))
-        );
     }
 }
