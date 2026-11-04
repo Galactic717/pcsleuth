@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>pcsleuth</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#results">Skip to the answer</a>
+    <div class="shell">
+      <header class="masthead">
+        <h1>pcsleuth</h1>
+        <p>Why did my PC do that? Answers come from logs Windows already keeps, read on this PC.</p>
+      </header>
+
+      <nav class="questions" aria-label="Questions">
+        <ul id="nav"></ul>
+      </nav>
+
+      <main id="main">
+        <div class="view-head">
+          <h2 id="title" tabindex="-1">Timeline</h2>
+          <button id="refresh" class="button" type="button">Refresh</button>
+        </div>
+        <p id="about" class="about"></p>
+        <div id="results" tabindex="-1" aria-busy="false"></div>
+      </main>
+
+      <footer class="colophon">
+        <p>
+          pcsleuth only reads. Fixes appear as commands for you to run yourself; this app never runs
+          them and never changes a setting.
+        </p>
+      </footer>
+    </div>
+    <div id="status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

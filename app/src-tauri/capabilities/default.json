@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The main window may ask the eight questions and start the elevated read. Nothing else: no files, no shell, no network, no plugins.",
+  "windows": ["main"],
+  "permissions": [
+    "allow-timeline",
+    "allow-wake",
+    "allow-nosleep",
+    "allow-battery",
+    "allow-crash",
+    "allow-slow",
+    "allow-now",
+    "allow-doctor",
+    "allow-elevated"
+  ]
+}
