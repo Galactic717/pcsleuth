@@ -509,6 +509,41 @@ mod tests {
         }
     }
 
+    fn options(sleep: bool) -> Options {
+        Options {
+            pcsleuth: None,
+            scenarios: vec![],
+            sleep,
+            out: None,
+        }
+    }
+
+    fn env(tag: &'static str) -> Env {
+        Env {
+            tag,
+            elevated: false,
+            os_build: "10.0.0".into(),
+            git_commit: "abc".into(),
+            git_dirty: false,
+            date: Timestamp::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn the_default_run_skips_sleep_scenarios_without_asking_anything() {
+        // No prompt can happen here: the function returns before it would read stdin.
+        let why = sleep_block(&options(false), &env("laptop"), true).unwrap();
+        assert!(why.contains("--sleep"), "{why}");
+        // Nothing to block when no sleep scenario is selected.
+        assert_eq!(sleep_block(&options(true), &env("laptop"), false), None);
+    }
+
+    #[test]
+    fn ci_refuses_sleep_even_with_the_flag() {
+        let why = sleep_block(&options(true), &env("ci"), true).unwrap();
+        assert!(why.contains("CI"), "{why}");
+    }
+
     #[test]
     fn select_defaults_to_all_and_rejects_unknown_names() {
         assert_eq!(select(&[]).unwrap().len(), SCENARIOS.len());

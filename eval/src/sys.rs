@@ -11,18 +11,22 @@ pub fn interrupted() -> bool {
     INTERRUPTED.load(Ordering::Relaxed)
 }
 
+/// What the console handler does, callable directly so a test can exercise the same path
+/// without sending a real Ctrl+C to the console the test run shares.
+pub fn request_interrupt() {
+    INTERRUPTED.store(true, Ordering::Relaxed);
+}
+
 #[cfg(windows)]
 pub use win::*;
 
 #[cfg(windows)]
 mod win {
+    use anyhow::Result;
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::os::windows::io::AsRawHandle;
     use std::process::Child;
-    use std::sync::atomic::Ordering;
-
-    use anyhow::Result;
     use windows::Wdk::System::SystemServices::RtlGetVersion;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
@@ -39,10 +43,10 @@ mod win {
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::core::BOOL;
 
-    use super::INTERRUPTED;
+    use super::request_interrupt;
 
     unsafe extern "system" fn on_ctrl(_kind: u32) -> BOOL {
-        INTERRUPTED.store(true, Ordering::Relaxed);
+        request_interrupt();
         // Handled: do not let the default handler end the process before the guards run.
         BOOL(1)
     }
