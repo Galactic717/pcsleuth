@@ -434,9 +434,13 @@ mod app {
             duration.as_secs(),
             interval.as_secs_f64()
         );
+        // A ring that was already there (possibly the real one, given with --ring) is not ours to
+        // delete: measuring adds its rows to it, which are real samples, and leaves it in place.
+        let existed = ring_path.exists();
         let result = measure::measure(&ring_path, duration, interval, &stop);
-        // The measurement ring is scratch; remove it whatever happened.
-        let _ = std::fs::remove_file(&ring_path);
+        if !existed {
+            let _ = std::fs::remove_file(&ring_path);
+        }
         match result {
             Ok(report) => {
                 println!("{report}");

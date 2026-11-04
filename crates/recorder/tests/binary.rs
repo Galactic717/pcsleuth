@@ -132,6 +132,36 @@ fn a_sample(secs: i64) -> ring::Sample {
 }
 
 #[test]
+fn measure_never_deletes_a_ring_that_was_already_there() {
+    let dir = Scratch::new("measure-keeps");
+    let path = dir.ring();
+    {
+        let mut w = ring::RingWriter::open(&path, 8 * ring::BLOCK as u64, 60).unwrap();
+        for n in 0..3 {
+            w.append(&a_sample(n)).unwrap();
+        }
+    }
+    let out = run(&[
+        "--measure",
+        "2",
+        "--interval",
+        "1",
+        "--ring",
+        path.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    // Still there, still the same size, and its three old rows are still in it.
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        8 * ring::BLOCK as u64
+    );
+    let since = jiff::Timestamp::from_second(T0).unwrap();
+    let rows = read_rows(&path, since);
+    assert!(rows.data.len() >= 3, "{} rows", rows.data.len());
+    assert!(rows.data.iter().take(3).all(|r| r.interval_secs == 60));
+}
+
+#[test]
 fn a_damaged_ring_is_refused_with_the_reason_and_kept_until_reset_is_asked_for() {
     let dir = Scratch::new("damaged");
     let path = dir.ring();
