@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use pcsleuth_core::Access;
 use pcsleuth_recorder::runner::{Live, Tick};
 use pcsleuth_recorder::service::{self, SERVICE_NAME};
-use pcsleuth_recorder::{read_samples, service_ring_path, status, winapi};
+use pcsleuth_recorder::{read_rows, service_ring_path, status, winapi};
 use pcsleuth_sources::power::is_elevated;
 
 const BIN: &str = env!("CARGO_BIN_EXE_pcsleuth-recorder");
@@ -93,7 +93,7 @@ fn elevated_a_tick_sees_power_requests() {
     match live.tick() {
         Tick::Row(sample) => {
             assert!(
-                sample.requests_visible,
+                sample.row.requests_visible,
                 "power_requests was not readable while elevated"
             );
             eprintln!(
@@ -188,10 +188,10 @@ fn elevated_install_start_record_stop_uninstall() {
     let ring = service_ring_path();
     let end = Instant::now() + Duration::from_secs(30);
     let since = jiff::Timestamp::from_second(1_700_000_000).unwrap();
-    while Instant::now() < end && read_samples(&ring, since).data.len() < 3 {
+    while Instant::now() < end && read_rows(&ring, since).data.len() < 3 {
         std::thread::sleep(Duration::from_millis(500));
     }
-    let samples = read_samples(&ring, since);
+    let samples = read_rows(&ring, since);
     assert!(
         samples.data.len() >= 3,
         "{} rows, {:?}",
@@ -200,7 +200,7 @@ fn elevated_install_start_record_stop_uninstall() {
     );
     // LocalSystem can read the power request list, so every row says requests were visible.
     assert!(
-        samples.data.iter().all(|s| s.requests_visible),
+        samples.data.iter().all(|r| r.requests_visible),
         "{:?}",
         samples.access
     );

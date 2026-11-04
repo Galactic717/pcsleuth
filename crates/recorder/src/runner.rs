@@ -137,7 +137,7 @@ impl Live {
     }
 
     /// Read processes and power requests once. Without admin the power read says so
-    /// ([`Sample::requests_visible`] is false) and the row is still recorded.
+    /// ([`RecorderRow::requests_visible`] is false) and the row is still recorded.
     pub fn tick(&mut self) -> Tick {
         use pcsleuth_sources::{power, processes};
 
@@ -201,8 +201,8 @@ mod tests {
                 top_cpu: vec![],
                 top_io: vec![],
                 power_requests: vec![],
+                requests_visible: true,
             },
-            requests_visible: true,
             truncated: false,
         }
     }

@@ -32,4 +32,10 @@ pub struct RecorderRow {
     pub top_cpu: Vec<RecordedProcess>,
     pub top_io: Vec<RecordedProcess>,
     pub power_requests: Vec<RecordedRequest>,
+    /// False when the recorder could not read power requests for this sample, because it was not
+    /// running as admin. An empty `power_requests` then means "not visible", never "none held", so
+    /// no finding may treat it as proof that nothing kept the PC awake. The CPU and IO rankings
+    /// are not affected. Data without this field reads as not visible, the safe answer.
+    #[serde(default)]
+    pub requests_visible: bool,
 }

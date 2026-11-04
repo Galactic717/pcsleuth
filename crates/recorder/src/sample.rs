@@ -31,8 +31,8 @@ pub fn build_sample(at: Timestamp, top: &Top, requests: &Sourced<PowerRequest>) 
             top_cpu: list(&top.by_cpu),
             top_io: list(&top.by_io),
             power_requests: requests.data.iter().flat_map(recorded_requests).collect(),
+            requests_visible: requests.access.is_ok(),
         },
-        requests_visible: requests.access.is_ok(),
         truncated: false,
     }
 }
@@ -163,7 +163,7 @@ mod tests {
         );
         assert_eq!(s.row.top_io[0].io_bytes_per_sec, 3_001);
         assert_eq!(s.row.top_io[0].cpu_permille, 0);
-        assert!(s.requests_visible && !s.truncated);
+        assert!(s.row.requests_visible && !s.truncated);
     }
 
     #[test]
@@ -182,10 +182,10 @@ mod tests {
         let denied = Sourced::unreadable(SourceId::PowerRequests, Access::NeedsAdmin);
         let s = build_sample(at(), &top(60.0), &denied);
         assert!(s.row.power_requests.is_empty());
-        assert!(!s.requests_visible);
+        assert!(!s.row.requests_visible);
         // A read that listed nothing is a real "none held".
         let none = Sourced::ok(SourceId::PowerRequests, vec![]);
-        assert!(build_sample(at(), &top(60.0), &none).requests_visible);
+        assert!(build_sample(at(), &top(60.0), &none).row.requests_visible);
         // A partial read is not a full one either.
         let partial = Sourced {
             source: SourceId::PowerRequests,
@@ -194,7 +194,11 @@ mod tests {
             },
             data: vec![],
         };
-        assert!(!build_sample(at(), &top(60.0), &partial).requests_visible);
+        assert!(
+            !build_sample(at(), &top(60.0), &partial)
+                .row
+                .requests_visible
+        );
     }
 
     #[test]

@@ -7,9 +7,8 @@
 //!
 //! - [`default_ring_path`]: where to look. The service's ring if there is one, else the user's.
 //! - [`read_rows`]: the rows since a time, as the contract type. No ring file is
-//!   [`Access::Missing`], never an error.
-//! - [`read_samples`]: the same rows with whether each could see power requests. Prefer this when
-//!   an empty `power_requests` must not be read as "none held".
+//!   [`Access::Missing`], never an error. Each row says in `requests_visible` whether power
+//!   requests could be seen, so an empty list is never taken for "none held".
 //! - [`status`]: what is in the ring.
 
 #[cfg(windows)]
@@ -122,22 +121,27 @@ fn read_scan(path: &Path) -> Result<ring::Scan, RingError> {
     ring::scan(&mut File::open(path)?)
 }
 
-/// The samples at or after `since`, oldest first, with whether each could see power requests.
+/// The rows at or after `since`, oldest first.
 ///
 /// A missing file is [`Access::Missing`] and an unreadable one [`Access::NeedsAdmin`] or
 /// [`Access::Failed`], all with no data. A ring with torn or damaged slots is
 /// [`Access::Partial`] saying how many were skipped, with the rest returned.
-pub fn read_samples(path: &Path, since: Timestamp) -> Sourced<Sample> {
+///
+/// Rows recorded without admin are returned like any other and the read is still
+/// [`Access::Ok`]: they are good samples of CPU and IO, and each says in
+/// [`RecorderRow::requests_visible`] that its empty `power_requests` means "not visible", not
+/// "none held". Whoever reads power requests must look at that flag.
+pub fn read_rows(path: &Path, since: Timestamp) -> Sourced<RecorderRow> {
     let source = SourceId::Recorder;
     let scan = match read_scan(path) {
         Ok(scan) => scan,
         Err(e) => return Sourced::unreadable(source, access_from_error(&e)),
     };
-    let data: Vec<Sample> = scan
+    let data: Vec<RecorderRow> = scan
         .samples
         .into_iter()
-        .map(|(_, sample)| sample)
-        .filter(|s| s.row.at >= since)
+        .map(|(_, sample)| sample.row)
+        .filter(|row| row.at >= since)
         .collect();
     if scan.skipped == 0 {
         return Sourced::ok(source, data);
@@ -151,38 +155,6 @@ pub fn read_samples(path: &Path, since: Timestamp) -> Sourced<Sample> {
         access: Access::Partial { message },
         data,
     }
-}
-
-/// The rows at or after `since`, oldest first, as the contract type.
-///
-/// `RecorderRow` cannot say that a row was recorded without admin, when power requests were not
-/// visible and an empty list means nothing. So that is reported here as [`Access::Partial`]
-/// together with any skipped slots; the engine should use [`read_samples`] to know which rows.
-pub fn read_rows(path: &Path, since: Timestamp) -> Sourced<RecorderRow> {
-    let read = read_samples(path, since);
-    let blind = read.data.iter().filter(|s| !s.requests_visible).count();
-    let access = match (read.access, blind) {
-        (access, 0) => access,
-        (Access::Ok, blind) => Access::Partial {
-            message: blind_message(blind, read.data.len()),
-        },
-        (Access::Partial { message }, blind) => Access::Partial {
-            message: format!("{message}; {}", blind_message(blind, read.data.len())),
-        },
-        (other, _) => other,
-    };
-    Sourced {
-        source: read.source,
-        access,
-        data: read.data.into_iter().map(|s| s.row).collect(),
-    }
-}
-
-fn blind_message(blind: usize, total: usize) -> String {
-    format!(
-        "power requests were not visible in {blind} of {total} row(s) because the recorder was \
-         not elevated, so an empty list there does not mean none were held"
-    )
 }
 
 /// What a ring file holds.
@@ -249,7 +221,7 @@ pub fn status(path: &Path) -> Sourced<Status> {
         rows_without_request_visibility: scan
             .samples
             .iter()
-            .filter(|(_, s)| !s.requests_visible)
+            .filter(|(_, s)| !s.row.requests_visible)
             .count() as u32,
         oldest: times.clone().min(),
         newest: times.max(),
@@ -302,8 +274,8 @@ mod tests {
                 } else {
                     vec![]
                 },
+                requests_visible: visible,
             },
-            requests_visible: visible,
             truncated: false,
         }
     }
@@ -341,7 +313,6 @@ mod tests {
         assert!(rows.data.is_empty());
         assert_eq!(rows.source, SourceId::Recorder);
         assert_eq!(status(&dir.ring()).access, Access::Missing);
-        assert_eq!(read_samples(&dir.ring(), at(0)).access, Access::Missing);
     }
 
     #[test]
@@ -361,28 +332,25 @@ mod tests {
     }
 
     #[test]
-    fn rows_recorded_without_admin_are_flagged_through_partial() {
+    fn rows_recorded_without_admin_read_ok_and_say_so_themselves() {
         let dir = Dir::new("blind");
         write(
             &dir.ring(),
             &[sample(0, false), sample(60, true), sample(120, false)],
         );
-        let samples = read_samples(&dir.ring(), at(0));
-        assert_eq!(samples.access, Access::Ok);
+        let rows = read_rows(&dir.ring(), at(0));
+        // Good samples of CPU and IO: the read is Ok, not Partial.
+        assert_eq!(rows.access, Access::Ok);
         assert_eq!(
-            samples
-                .data
+            rows.data
                 .iter()
-                .map(|s| s.requests_visible)
+                .map(|r| r.requests_visible)
                 .collect::<Vec<_>>(),
             vec![false, true, false]
         );
-        let rows = read_rows(&dir.ring(), at(0));
-        match rows.access {
-            Access::Partial { message } => assert!(message.contains("2 of 3"), "{message}"),
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(rows.data.len(), 3);
+        // The row that could not see requests has none to show, and says why.
+        assert!(rows.data[0].power_requests.is_empty() && !rows.data[0].requests_visible);
+        assert_eq!(rows.data[1].power_requests.len(), 1);
     }
 
     #[test]

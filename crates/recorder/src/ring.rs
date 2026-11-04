@@ -57,13 +57,11 @@ const _: () = assert!(PAYLOAD_FIXED + 2 * MAX_PER_LIST * (1 + NAME_MAX + 4 + 8) 
 // REASON_MAX is the longest string, and 255 is the "no string" marker.
 const _: () = assert!(REASON_MAX < NO_STRING as usize);
 
-/// One sample as stored: the contract row plus what the row type cannot say.
+/// One sample as stored: the contract row (which says whether power requests were visible) and
+/// whether the slot had to cut anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sample {
     pub row: RecorderRow,
-    /// False when power requests could not be read (no admin), so an empty
-    /// `row.power_requests` means "not visible", never "none held".
-    pub requests_visible: bool,
     /// Set by the writer when a name was cut or an entry did not fit. Ignored when writing.
     pub truncated: bool,
 }
@@ -241,7 +239,7 @@ pub fn encode_slot(seq: u64, sample: &Sample) -> [u8; BLOCK] {
     p[12..15].copy_from_slice(&[n_cpu, n_io, n_req]);
 
     let mut flags = 0u16;
-    if sample.requests_visible {
+    if row.requests_visible {
         flags |= FLAG_REQUESTS_VISIBLE;
     }
     if truncated {
@@ -361,8 +359,8 @@ fn decode_payload(p: &[u8], flags: u16) -> Option<Sample> {
             top_cpu,
             top_io,
             power_requests,
+            requests_visible: flags & FLAG_REQUESTS_VISIBLE != 0,
         },
-        requests_visible: flags & FLAG_REQUESTS_VISIBLE != 0,
         truncated: flags & FLAG_TRUNCATED != 0,
     })
 }
@@ -710,8 +708,8 @@ mod tests {
                 top_cpu: vec![proc("chrome.exe", 250 + n as u32, 1_000)],
                 top_io: vec![proc("svchost.exe", 3, 4_000_000)],
                 power_requests: vec![request("teams.exe", "display", Some("In a call"))],
+                requests_visible: true,
             },
-            requests_visible: true,
             truncated: false,
         }
     }
@@ -784,11 +782,11 @@ mod tests {
     fn requests_not_visible_is_kept() {
         let mut w = ring(4);
         let mut s = sample(1);
-        s.requests_visible = false;
+        s.row.requests_visible = false;
         s.row.power_requests.clear();
         w.append(&s).unwrap();
         let got = scan_of(&w).unwrap();
-        assert!(!got.samples[0].1.requests_visible);
+        assert!(!got.samples[0].1.row.requests_visible);
         assert!(got.samples[0].1.row.power_requests.is_empty());
     }
 

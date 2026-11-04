@@ -9,7 +9,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use pcsleuth_core::Access;
-use pcsleuth_recorder::{read_rows, read_samples, ring, status};
+use pcsleuth_recorder::{read_rows, ring, status};
 use pcsleuth_sources::power::is_elevated;
 
 const BIN: &str = env!("CARGO_BIN_EXE_pcsleuth-recorder");
@@ -125,8 +125,8 @@ fn a_sample(secs: i64) -> ring::Sample {
             top_cpu: vec![],
             top_io: vec![],
             power_requests: vec![],
+            requests_visible: true,
         },
-        requests_visible: true,
         truncated: false,
     }
 }
@@ -298,21 +298,14 @@ fn console_ctrl_break_stops_foreground_cleanly_and_what_it_wrote_reads_back() {
         rows.access
     );
     assert!(rows.data.iter().all(|r| r.interval_secs >= 1));
-    let samples = read_samples(&dir.ring(), since);
+    // Every row says whether power requests could be seen. Unelevated they cannot, and the read is
+    // still Ok: these are good samples, not a damaged ring.
     assert!(
-        samples
-            .data
+        rows.data
             .iter()
-            .all(|s| s.requests_visible == is_elevated())
+            .all(|r| r.requests_visible == is_elevated())
     );
-    if !is_elevated() {
-        // Unelevated: power requests are not visible, and the read says so.
-        assert!(
-            matches!(rows.access, Access::Partial { .. }),
-            "{:?}",
-            rows.access
-        );
-    }
+    assert_eq!(rows.access, Access::Ok);
     let st = status(&dir.ring());
     assert_eq!(st.data[0].size_bytes, ring::DEFAULT_BYTES);
     assert_eq!(

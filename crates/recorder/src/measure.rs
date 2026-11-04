@@ -83,7 +83,7 @@ pub fn measure(
         || live.tick(),
         |event| {
             if let Event::Row(sample) = event {
-                visible_rows += u32::from(sample.requests_visible);
+                visible_rows += u32::from(sample.row.requests_visible);
             }
         },
     );

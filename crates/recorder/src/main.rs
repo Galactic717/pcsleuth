@@ -403,7 +403,7 @@ mod app {
                         "{} {} B/s",
                         p.name, p.io_bytes_per_sec
                     )),
-                    if sample.requests_visible {
+                    if sample.row.requests_visible {
                         sample.row.power_requests.len().to_string()
                     } else {
                         "not visible".into()
