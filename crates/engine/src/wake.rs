@@ -183,7 +183,7 @@ fn wake_finding(
             format!(
                 "After the PC had slept for a while, Windows saved its memory to disk and powered \
                  it off (hibernate) on its own timer. {log} records this as a doze timer, not as \
-                 a wake: nothing woke the PC."
+                 a wake."
             ),
             with_extra(evidence()),
         )
@@ -326,14 +326,15 @@ fn unknown_finding(
     let (explanation, gap) = if kind == Kind::Hibernate {
         (
             format!(
-                "{log} lists the wake source as \"unknown\". Hibernate saves the PC's memory to \
-                 disk and powers it off, and the firmware (the PC's built-in software) does not report what caused a wake from \
-                 hibernate, so this is normal and says nothing about a fault.{slept}"
+                "{log} lists the wake source as \"unknown\": Windows received no wake source for \
+                 this wake. Hibernate saves the PC's memory to disk and turns it off. A missing \
+                 source is often seen after hibernate because the PC was fully off, but it can \
+                 also have other causes.{slept}"
             ),
             NotRecorded::new(
                 "what woke the PC from hibernate",
-                "nothing in Windows can capture it: the PC's firmware does not report a wake source after \
-                 hibernate. Wakes from sleep (not hibernate) are normally named.",
+                "no software runs while the PC is off, so pcsleuth cannot capture it; waking from \
+                 sleep instead of hibernate usually gives a named source.",
             ),
         )
     } else {

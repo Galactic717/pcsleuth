@@ -76,7 +76,7 @@ fn timeout_findings(settings: &Sourced<SleepSettings>, now: jiff::Timestamp, out
                             "The sleep timeout is set to Never {when}, so Windows will not sleep on its own"
                         ),
                         "The active power plan says never to put the PC to sleep after it has been \
-                         idle. It can still sleep from the Start menu, the lid or the power button.",
+                         idle. The PC can still be put to sleep by hand, and the lid and power button have their own settings.",
                         [evidence("never".into())],
                     )
                     .map(|f| {
@@ -124,8 +124,8 @@ fn last_input_finding(input: &Sourced<LastInput>, now: jiff::Timestamp, out: &mu
             "The last keyboard or mouse input was {} ago",
             duration(last.idle)
         ),
-        "Windows counts the idle time before sleep from the last input. A program that sends \
-         fake input counts as you.",
+        "The sleep timeout counts idle time, which is measured from the last input. A program \
+         that sends fake input counts as you.",
         [live(SourceId::PowerState, now).with_field("last_input", last.at.to_string())],
     ));
 }
@@ -177,7 +177,8 @@ fn last_sleep_finding(
         format!("The PC last woke from {}{ago}", kind.noun()),
         format!(
             "This is from Windows' wake log (Power-Troubleshooter).{before} The log has no later \
-             wake, so the PC has been awake since."
+             wake, so the PC has not resumed from sleep or hibernate since; it may have been \
+             restarted."
         ),
         [crate::common::stamped(wake.to_evidence(), &wake.meta)],
     ));

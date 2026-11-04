@@ -151,17 +151,17 @@ fn hibernate_wake_with_no_source_says_what_it_does_not_know_and_why() {
     );
     assert_eq!(
         finding.explanation(),
-        "Windows' wake log (Power-Troubleshooter, event 1) lists the wake source as \"unknown\". \
-         Hibernate saves the PC's memory to disk and powers it off, and the firmware (the PC's \
-         built-in software) does not report what caused a wake from hibernate, so this is normal \
-         and says nothing about a fault. The PC had been hibernating for 21 min."
+        "Windows' wake log (Power-Troubleshooter, event 1) lists the wake source as \"unknown\": \
+         Windows received no wake source for this wake. Hibernate saves the PC's memory to disk \
+         and turns it off. A missing source is often seen after hibernate because the PC was \
+         fully off, but it can also have other causes. The PC had been hibernating for 21 min."
     );
     let gap = finding.gap().unwrap();
     assert_eq!(gap.what, "what woke the PC from hibernate");
     assert_eq!(
         gap.would_capture,
-        "nothing in Windows can capture it: the PC's firmware does not report a wake source after \
-         hibernate. Wakes from sleep (not hibernate) are normally named."
+        "no software runs while the PC is off, so pcsleuth cannot capture it; waking from sleep \
+         instead of hibernate usually gives a named source."
     );
 }
 
@@ -176,9 +176,9 @@ fn a_lost_power_restart_reads_plainly() {
     assert_eq!(
         finding.explanation(),
         "Windows found that the PC had not shut down cleanly (Kernel-Power event 41, EventLog \
-         event 6008) and recorded no blue screen and no power button hold. Common reasons are a \
-         power cut, a flat battery, a hard reset or a hardware fault, but Windows did not record \
-         which."
+         event 6008) and recorded no blue screen code and no power button hold. Possible reasons \
+         include a power cut, a flat battery, a hard reset or a hardware fault; Windows did not \
+         record which."
     );
 }
 
@@ -209,8 +209,8 @@ fn a_sleep_timeout_of_never_reads_plainly() {
     );
     assert_eq!(
         finding.explanation(),
-        "The active power plan says never to put the PC to sleep after it has been idle. It can \
-         still sleep from the Start menu, the lid or the power button."
+        "The active power plan says never to put the PC to sleep after it has been idle. The PC \
+         can still be put to sleep by hand, and the lid and power button have their own settings."
     );
 }
 

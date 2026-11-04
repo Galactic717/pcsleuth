@@ -78,8 +78,11 @@ fn record_364927_is_a_not_recorded_wake_from_hibernate() {
         finding.headline(),
         "Woke from hibernate: Windows did not record what woke it"
     );
-    assert!(finding.explanation().contains("firmware"));
+    assert!(finding.explanation().contains("received no wake source"));
     assert!(finding.explanation().contains("hibernate"));
+    // Only what is known: no "normal", no "nothing can capture it".
+    let words = finding.explanation().to_lowercase();
+    assert!(!words.contains("normal") && !words.contains("nothing in windows"));
     let gap = finding.gap().unwrap();
     assert!(gap.what.contains("hibernate"));
     assert!(!gap.would_capture.trim().is_empty());
@@ -139,7 +142,7 @@ fn the_s4_doze_record_is_windows_moving_to_hibernate_not_a_wake() {
             finding.headline(),
             "Windows moved the PC from sleep to hibernate by itself"
         );
-        assert!(finding.explanation().contains("nothing woke the PC"));
+        assert!(finding.explanation().contains("not as a wake"));
     }
     // 11 records, 2 of them doze records, and nothing else is dropped.
     assert_eq!(answer.findings.len(), 11);

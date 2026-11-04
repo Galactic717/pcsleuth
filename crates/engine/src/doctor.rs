@@ -93,7 +93,7 @@ fn adds(source: SourceId) -> &'static str {
 
 /// The cost of switching on a log, printed with its command.
 const LOG_COST: &str = "Switches the log on. It costs a little disk and a little CPU: Windows \
-    keeps the log at a fixed size and overwrites its oldest records. It records only from the \
+    keeps the log at a limited size, normally overwriting its oldest records. It records only from the \
     moment it is switched on, so it cannot explain what happened before. Needs admin. pcsleuth \
     does not run this for you.";
 

@@ -484,15 +484,27 @@ fn restart_finding(group: &[&Piece], window: &Window) -> Result<Finding, Finding
         .filter(|n| *n > 0)
         .map(|_| " Windows also noted that a sleep was in progress.")
         .unwrap_or_default();
+    // Say "recorded no X" only for what the record actually carries and found empty.
+    let mut empty = Vec::new();
+    if reboot.is_some_and(|r| r.bugcheck_code == Some(0)) {
+        empty.push("no blue screen code");
+    }
+    if reboot.is_some_and(|r| r.long_power_button_press == Some(false)) {
+        empty.push("no power button hold");
+    }
+    let absent = if empty.is_empty() {
+        String::new()
+    } else {
+        format!(" and recorded {}", empty.join(" and "))
+    };
     not_recorded_citing(
         "crash.power_lost",
         Question::Crash,
         "The PC lost power or stopped completely, and Windows does not know why".into(),
         format!(
             "Windows found that the PC had not shut down cleanly (Kernel-Power event 41, EventLog \
-             event 6008) and recorded no blue screen and no power button hold. Common reasons are \
-             a power cut, a flat battery, a hard reset or a hardware fault, but Windows did not \
-             record which.{sleeping}"
+             event 6008){absent}. Possible reasons include a power cut, a flat battery, a hard \
+             reset or a hardware fault; Windows did not record which.{sleeping}"
         ),
         NotRecorded::new(
             "why the PC lost power",
