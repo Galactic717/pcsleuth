@@ -6,3 +6,34 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+# `cargo run -p pcsleuth-eval -- run` must pick the runner, not one of the injectors.
+default-run = "pcsleuth-eval"
+
+# The injectors in src/bin/ are discovered by cargo and named after their files:
+# pcsleuth-fault-*.exe. Their names are the attribution the scorer looks for.
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+jiff.workspace = true
+pcsleuth-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Wdk_System_SystemServices",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_ErrorReporting",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Power",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+]
