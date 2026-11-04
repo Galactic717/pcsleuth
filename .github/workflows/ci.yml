@@ -1,7 +1,8 @@
 name: CI
 
 # Every push and every pull request. Nothing here is allowed to fail quietly: no continue-on-error,
-# no `|| true`. A red step is a real problem.
+# no `|| true`. A red step is a real problem. The steps are independent (`!cancelled()`), so one red
+# step does not hide whether the others pass; the job still fails if any of them does.
 on:
   push:
     branches: ['**']
@@ -48,40 +49,49 @@ jobs:
           cache-dependency-path: app/package-lock.json
 
       - name: Format
+        if: ${{ !cancelled() }}
         run: cargo fmt --all --check
 
       - name: Clippy
+        if: ${{ !cancelled() }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # Includes the no-network test (rule 2) and the fixture redaction check. --no-fail-fast runs every
       # crate, so one red crate does not hide the others.
       - name: Test
+        if: ${{ !cancelled() }}
         run: cargo test --workspace --no-fail-fast --locked
 
       # The page: npm ci installs exactly what package-lock.json pins.
       - name: App, install
+        if: ${{ !cancelled() }}
         working-directory: app
         run: npm ci
 
       - name: App, typecheck
+        if: ${{ !cancelled() }}
         working-directory: app
         run: npm run typecheck
 
       - name: App, test
+        if: ${{ !cancelled() }}
         working-directory: app
         run: npm test
 
       - name: App, build
+        if: ${{ !cancelled() }}
         working-directory: app
         run: npm run build
 
       # The core crate must stay portable: the contract types are read by tools that do not run on Windows.
       - name: Check the core crate for Linux
+        if: ${{ !cancelled() }}
         run: cargo check -p pcsleuth-core --target x86_64-unknown-linux-gnu --locked
 
       # The runner is an elevated VM that cannot sleep, so a sleep or wake scenario reports not_run
       # there, and that is the correct result. Low scores do not fail this step; a harness error does.
       - name: Eval
+        if: ${{ !cancelled() }}
         env:
           PCSLEUTH_EVAL_WHERE: ci
         run: cargo run -p pcsleuth-eval --locked -- run
