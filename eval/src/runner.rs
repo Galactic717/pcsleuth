@@ -309,18 +309,28 @@ impl Ctx<'_> {
         // Kept alive until the question is answered, then dropped: that kills and cleans up.
         let _held = match scenario.inject {
             Inject::Live {
-                secs, settle_secs, ..
+                secs,
+                settle_secs,
+                decoy,
+                ..
             } => {
+                let mut held = Vec::new();
+                if let Some(decoy) = decoy {
+                    let mut idle = self.spawn(decoy, &["--secs", &secs.to_string()])?;
+                    idle.wait_ready()?;
+                    held.push(idle);
+                }
                 let mut injected = self.spawn(fault, &["--secs", &secs.to_string()])?;
                 injected.wait_ready()?;
                 nap(Duration::from_secs(settle_secs))?;
-                injected
+                held.push(injected);
+                held
             }
             Inject::Past { secs, .. } => {
                 let mut injected = self.spawn(fault, &["--secs", &secs.to_string()])?;
                 injected.wait_ready()?;
                 injected.wait_exit(Duration::from_secs(secs + 20))?;
-                injected
+                vec![injected]
             }
             Inject::Event {
                 provider, event_id, ..
@@ -337,9 +347,9 @@ impl Ctx<'_> {
                             )
                         })?;
                 record_ids.push(event.record_id);
-                injected
+                vec![injected]
             }
-            Inject::Sleep { hibernate, .. } => self.sleep_and_wake(fault, hibernate)?,
+            Inject::Sleep { hibernate, .. } => vec![self.sleep_and_wake(fault, hibernate)?],
         };
         let answer = ask(self.job, self.tool, scenario.question, since);
         let expect = Expect {
