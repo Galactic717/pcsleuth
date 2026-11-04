@@ -514,11 +514,11 @@ mod tests {
     #[test]
     fn process_request_with_a_reason_reads_like_powercfg_requests() {
         // The shape `powercfg /requests` shows on this laptop under EXECUTION.
-        let image = r"\Device\HarddiskVolume3\Users\someone\.local\bin\claude.exe";
+        let image = r"\Device\HarddiskVolume3\Users\someone\.local\bin\example.exe";
         let buf = request_list(&[(
             [0, 0, 0, 1, 0, 0],
             Who::Process(4242, image),
-            Why::Text("Claude is working"),
+            Why::Text("Example app is working"),
         )]);
         let requests = parse_power_requests(&buf, REQUEST_TYPES_V4).unwrap();
         assert_eq!(
@@ -529,7 +529,7 @@ mod tests {
                     image: Some(image.into())
                 },
                 active: vec![(RequestType::Execution, 1)],
-                reason: Some(Reason::Text("Claude is working".into())),
+                reason: Some(Reason::Text("Example app is working".into())),
             }]
         );
     }
