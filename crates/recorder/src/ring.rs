@@ -609,12 +609,17 @@ impl<S: Storage> RingWriter<S> {
 impl RingWriter<File> {
     /// Open or create the ring at `path` (see [`RingWriter::start`]). The folder must exist.
     pub fn open(path: &Path, total_bytes: u64, interval_secs: u32) -> Result<Self, RingError> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        // Share for reading only. Without FILE_SHARE_DELETE the ring cannot be deleted or renamed
+        // out from under the writer, which would go on writing to a file nobody can reach; without
+        // FILE_SHARE_WRITE a second writer cannot open it. Readers (read access only) still can.
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::share_mode(
+            &mut options,
+            1, /* FILE_SHARE_READ */
+        );
+        let file = options.open(path)?;
         Self::start(file, total_bytes, interval_secs, Timestamp::now())
     }
 }
@@ -1085,6 +1090,26 @@ mod tests {
         let again = RingWriter::open(&path, 1 << 20, 30).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), total);
         assert_eq!(again.header().next_seq, 2_001);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_open_ring_cannot_be_deleted_replaced_or_written_by_another_but_can_be_read() {
+        let dir = TempDir::new("share");
+        let path = dir.0.join("test.ring");
+        let mut writer = RingWriter::open(&path, 8 * BLOCK as u64, 60).unwrap();
+        writer.append(&sample(1)).unwrap();
+        // Deleting or renaming it would leave the writer filling a file nobody can reach.
+        assert!(std::fs::remove_file(&path).is_err());
+        assert!(std::fs::rename(&path, dir.0.join("moved.ring")).is_err());
+        // A second writer is refused.
+        assert!(RingWriter::open(&path, 8 * BLOCK as u64, 60).is_err());
+        // A reader is not, and sees what has been written so far.
+        let got = scan(&mut File::open(&path).unwrap()).unwrap();
+        assert_eq!(seqs(&got), vec![1]);
+        // Once the writer has gone, the file can be removed again.
+        drop(writer);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

@@ -410,8 +410,11 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     // Best effort: the service still works, only at normal priority, if this fails.
     let _ = winapi::lower_thread_priority();
     let mut live = Live::start();
-    runner::run(&mut ring, *interval, &stop, None, || live.tick(), |_| {});
-    report(SERVICE_STOPPED, NO_ERROR, 0);
+    let stats = runner::run(&mut ring, *interval, &stop, None, || live.tick(), |_| {});
+    // If it gave up because nothing could be recorded, stop with that error code instead of
+    // staying Running. `sc query pcsleuth-recorder` shows it as WIN32_EXIT_CODE, and the Service
+    // Control Manager logs it.
+    report(SERVICE_STOPPED, stats.failed.unwrap_or(NO_ERROR), 0);
 }
 
 #[cfg(test)]

@@ -32,6 +32,8 @@ pub struct Report {
     pub ticks: u32,
     pub rows: u32,
     pub rows_with_requests_visible: u32,
+    /// Set when the run ended early because ticks kept failing; the numbers then cover less time.
+    pub failed: Option<u32>,
     /// Kernel plus user CPU time of this process in the window, from `GetProcessTimes`.
     pub cpu: Duration,
     /// `cpu` as a percentage of the whole machine.
@@ -100,6 +102,7 @@ pub fn measure(
         ticks: stats.ticks,
         rows: stats.rows_written,
         rows_with_requests_visible: visible_rows,
+        failed: stats.failed,
         cpu,
         cpu_percent: percent_of_machine(cpu, wall, logical_cpus),
         busy: stats.busy,
@@ -139,6 +142,12 @@ impl fmt::Display for Report {
             "ticks:                   {} ({} rows written, {} with power requests visible)",
             self.ticks, self.rows, self.rows_with_requests_visible
         )?;
+        if let Some(code) = self.failed {
+            writeln!(
+                f,
+                "ENDED EARLY:             ticks kept failing (error code {code}); the figures cover only the time that ran"
+            )?;
+        }
         writeln!(
             f,
             "CPU used (GetProcessTimes): {:.1} ms = {:.4}% of the whole machine",

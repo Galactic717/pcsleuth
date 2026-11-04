@@ -368,7 +368,17 @@ mod app {
             "Stopped. {} rows written, {} ticks skipped for unreadable process lists, {} write failures.",
             stats.rows_written, stats.unreadable, stats.write_failures
         );
-        ExitCode::SUCCESS
+        match stats.failed {
+            None => ExitCode::SUCCESS,
+            Some(code) => {
+                eprintln!(
+                    "pcsleuth-recorder: gave up after {} failed ticks in a row, last error code {code}; \
+                     nothing was being recorded.",
+                    runner::MAX_CONSECUTIVE_FAILURES
+                );
+                ExitCode::FAILURE
+            }
+        }
     }
 
     fn measure_run(ring_path: PathBuf, duration: Duration, interval: Duration) -> ExitCode {

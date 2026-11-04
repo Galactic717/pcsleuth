@@ -36,9 +36,22 @@ pub struct LoopStats {
     /// Wall time spent inside ticks, reading and writing.
     pub busy: Duration,
     pub slowest_tick: Duration,
+    /// Set when the loop gave up: the Win32 error code of the failure that ended it (see
+    /// [`MAX_CONSECUTIVE_FAILURES`]). `None` when it ended by a stop or by its deadline.
+    pub failed: Option<u32>,
 }
 
-/// Run until `stop` fires (or its sender is gone) or `until` passes, ticking every `interval`.
+/// A recorder that records nothing must not look like one that works. After this many ticks in a
+/// row that read no process list or could not write, the loop ends with [`LoopStats::failed`]
+/// set, so the service stops with the error code and `--foreground` exits with it.
+pub const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+/// `ERROR_WRITE_FAULT`, when a write failed without an OS code of its own.
+const ERROR_WRITE_FAULT: u32 = 29;
+/// `ERROR_READ_FAULT`, for a process list that could not be read.
+const ERROR_READ_FAULT: u32 = 30;
+
+/// Run until `stop` fires (or its sender is gone) or `until` passes, ticking every `interval`, or
+/// until [`MAX_CONSECUTIVE_FAILURES`] ticks in a row have failed.
 ///
 /// Ticks fall on a fixed grid from the start, so a slow tick does not push the later ones back. A
 /// loop that has fallen behind, after a long tick or a resume from sleep, skips the ticks it
@@ -52,6 +65,7 @@ pub fn run<S: Storage>(
     mut observe: impl FnMut(Event<'_>),
 ) -> LoopStats {
     let mut stats = LoopStats::default();
+    let mut failures_in_a_row = 0;
     let mut deadline = Instant::now() + interval;
     loop {
         let wake = until.map_or(deadline, |u| deadline.min(u));
@@ -62,19 +76,24 @@ pub fn run<S: Storage>(
         if Instant::now() >= deadline {
             let started = Instant::now();
             stats.ticks += 1;
+            // The Win32 code of this tick's failure, if it failed.
+            let mut failure = None;
             match tick() {
                 Tick::Baseline => observe(Event::Baseline),
                 Tick::Unreadable => {
                     stats.unreadable += 1;
+                    failure = Some(ERROR_READ_FAULT);
                     observe(Event::Unreadable);
                 }
                 Tick::Row(sample) => match ring.append(&sample) {
                     Ok(()) => {
                         stats.rows_written += 1;
+                        failures_in_a_row = 0;
                         observe(Event::Row(&sample));
                     }
                     Err(e) => {
                         stats.write_failures += 1;
+                        failure = Some(e.raw_os_error().map_or(ERROR_WRITE_FAULT, |c| c as u32));
                         observe(Event::WriteFailed(&e));
                     }
                 },
@@ -82,6 +101,13 @@ pub fn run<S: Storage>(
             let took = started.elapsed();
             stats.busy += took;
             stats.slowest_tick = stats.slowest_tick.max(took);
+            if let Some(code) = failure {
+                failures_in_a_row += 1;
+                if failures_in_a_row >= MAX_CONSECUTIVE_FAILURES {
+                    stats.failed = Some(code);
+                    break;
+                }
+            }
             deadline += interval;
             let now = Instant::now();
             if deadline <= now {
@@ -157,6 +183,8 @@ pub fn request_stop() {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
     use jiff::Timestamp;
@@ -187,6 +215,118 @@ mod tests {
             Timestamp::from_second(1_793_692_800).unwrap(),
         )
         .unwrap()
+    }
+
+    /// A ring whose writes can be made to fail, as a full or removed disk would.
+    struct Flaky {
+        inner: Cursor<Vec<u8>>,
+        fail: Arc<AtomicBool>,
+    }
+    impl std::io::Read for Flaky {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+    impl std::io::Write for Flaky {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(io::Error::from_raw_os_error(112)); // ERROR_DISK_FULL
+            }
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    impl std::io::Seek for Flaky {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+    impl Storage for Flaky {
+        fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+            self.inner.set_len(len)
+        }
+    }
+
+    fn flaky_ring() -> (RingWriter<Flaky>, Arc<AtomicBool>) {
+        let fail = Arc::new(AtomicBool::new(false));
+        let ring = RingWriter::start(
+            Flaky {
+                inner: Cursor::new(Vec::new()),
+                fail: Arc::clone(&fail),
+            },
+            16 * BLOCK as u64,
+            1,
+            Timestamp::from_second(1_793_692_800).unwrap(),
+        )
+        .unwrap();
+        (ring, fail)
+    }
+
+    #[test]
+    fn three_failed_writes_in_a_row_end_the_loop_with_the_error_code() {
+        let (mut ring, fail) = flaky_ring();
+        fail.store(true, Ordering::SeqCst);
+        let (_keep, rx) = mpsc::channel::<()>();
+        let mut n = 0;
+        let started = Instant::now();
+        // No deadline and no stop: only the failures can end it.
+        let stats = run(
+            &mut ring,
+            Duration::from_millis(5),
+            &rx,
+            None,
+            || {
+                n += 1;
+                Tick::Row(sample(n))
+            },
+            |_| {},
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(stats.failed, Some(112));
+        assert_eq!(stats.ticks, MAX_CONSECUTIVE_FAILURES);
+        assert_eq!(stats.write_failures, MAX_CONSECUTIVE_FAILURES);
+        assert_eq!(stats.rows_written, 0);
+    }
+
+    #[test]
+    fn a_good_tick_between_failures_starts_the_count_again() {
+        let (mut ring, fail) = flaky_ring();
+        let (_keep, rx) = mpsc::channel::<()>();
+        let mut n = 0u32;
+        let stats = run(
+            &mut ring,
+            Duration::from_millis(5),
+            &rx,
+            Some(Instant::now() + Duration::from_millis(200)),
+            || {
+                n += 1;
+                // Two failures, then a success, over and over: never three in a row.
+                fail.store(!n.is_multiple_of(3), Ordering::SeqCst);
+                Tick::Row(sample(i64::from(n)))
+            },
+            |_| {},
+        );
+        assert_eq!(stats.failed, None);
+        assert!(stats.ticks >= 9, "{stats:?}");
+        assert!(stats.write_failures > 0 && stats.rows_written > 0);
+    }
+
+    #[test]
+    fn an_unreadable_process_list_three_times_in_a_row_ends_the_loop_too() {
+        let mut ring = ring();
+        let (_keep, rx) = mpsc::channel::<()>();
+        let stats = run(
+            &mut ring,
+            Duration::from_millis(5),
+            &rx,
+            None,
+            || Tick::Unreadable,
+            |_| {},
+        );
+        assert_eq!(stats.failed, Some(30));
+        assert_eq!(stats.unreadable, MAX_CONSECUTIVE_FAILURES);
     }
 
     #[test]
