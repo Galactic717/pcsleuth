@@ -428,6 +428,19 @@ mod tests {
 
     use super::*;
 
+    /// Remove a folder that a test closed down to read-only for its user: first give it back the
+    /// permissions it would inherit, so the user can delete what is inside. Only ever called with
+    /// the explicit path of a folder the same test made.
+    fn remove_protected(dir: &Path) {
+        if dir.exists() {
+            let _ = std::process::Command::new("icacls")
+                .arg(dir)
+                .args(["/reset", "/T"])
+                .output();
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_path_is_under_a_folder_by_whole_components_ignoring_case() {
         let root = Path::new(r"C:\Program Files");
@@ -508,7 +521,7 @@ mod tests {
     #[test]
     fn a_new_folder_is_protected_with_exactly_system_administrators_and_the_user() {
         let dir = std::env::temp_dir().join(format!("pcsleuth-acl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_protected(&dir);
         let sid = current_user_sid().unwrap();
         create_protected_dir(&dir, &sid).unwrap();
         let sddl = dacl_sddl(&dir).unwrap();
@@ -516,7 +529,7 @@ mod tests {
         // Administrators entry does not apply to this token, so only the read entry does.)
         let listed = std::fs::read_dir(&dir).is_ok();
         let written = std::fs::write(dir.join("planted.txt"), b"x");
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_protected(&dir);
         eprintln!("DACL: {sddl}");
         assert!(listed, "the user cannot read their own folder");
         if !pcsleuth_sources::power::is_elevated() {
@@ -534,7 +547,7 @@ mod tests {
     #[test]
     fn an_existing_open_folder_is_closed_down_and_a_file_inside_inherits() {
         let dir = std::env::temp_dir().join(format!("pcsleuth-acl2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_protected(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let before = dacl_sddl(&dir).unwrap();
         let file = dir.join("recorder.ring");
@@ -554,7 +567,7 @@ mod tests {
         create_protected_dir_with(&dir, &sid, &|_| true).unwrap();
         let after = dacl_sddl(&dir).unwrap();
         let inner = dacl_sddl(&file).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+        remove_protected(&dir);
         eprintln!("before: {before}\nafter:  {after}\nfile:   {inner}");
         assert!(after.starts_with("D:P"), "{after}");
         assert_eq!(after.matches("(A;").count(), 3, "{after}");

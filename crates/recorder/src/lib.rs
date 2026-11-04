@@ -65,14 +65,28 @@ pub fn user_ring_path() -> PathBuf {
     under_env("LOCALAPPDATA")
 }
 
-/// The ring to read: the service's if that file exists, else the user's. The path may not exist,
+/// The ring to read: the service's if that file is there, else the user's. The path may not exist,
 /// and reading it then says [`Access::Missing`].
+///
+/// A service ring that this user is not allowed to see counts as there: it is `Access::NeedsAdmin`
+/// to read, which is the truth, not "missing". (`Path::exists` would say false for it.)
 pub fn default_ring_path() -> PathBuf {
-    let service = service_ring_path();
-    if service.exists() {
-        service
+    pick_ring(&service_ring_path(), &user_ring_path())
+}
+
+fn pick_ring(service: &Path, user: &Path) -> PathBuf {
+    if ring_is_there(std::fs::metadata(service).map(|_| ())) {
+        service.to_path_buf()
     } else {
-        user_ring_path()
+        user.to_path_buf()
+    }
+}
+
+/// True if the probe found the file, or found it but was not allowed to look.
+fn ring_is_there(probe: io::Result<()>) -> bool {
+    match probe {
+        Ok(()) => true,
+        Err(e) => e.kind() == io::ErrorKind::PermissionDenied,
     }
 }
 
@@ -195,6 +209,24 @@ impl Status {
     pub fn capacity(&self) -> Duration {
         Duration::from_secs(u64::from(self.slot_count) * u64::from(self.interval_secs))
     }
+
+    /// How old the newest row is at `now`. `None` for a ring with no rows, or when the newest row
+    /// is dated after `now` (the clock was set back).
+    pub fn newest_age(&self, now: Timestamp) -> Option<Duration> {
+        Duration::try_from(now.duration_since(self.newest?)).ok()
+    }
+
+    /// True if the newest row is old enough that the recorder is probably not running. It may also
+    /// be that the machine slept: the ring cannot tell the two apart.
+    pub fn looks_stopped(&self, now: Timestamp) -> bool {
+        self.newest_age(now)
+            .is_some_and(|age| is_stale(age, self.interval_secs))
+    }
+}
+
+/// A newest row older than three intervals, and than a minute, is stale.
+pub fn is_stale(age: Duration, interval_secs: u32) -> bool {
+    age > Duration::from_secs(u64::from(interval_secs) * 3).max(Duration::from_secs(60))
 }
 
 /// Describe the ring at `path`. Missing, unreadable and damaged files are [`Access`] values.
@@ -412,6 +444,84 @@ mod tests {
         assert_eq!(st.newest, Some(at(60)));
         assert_eq!(st.capacity(), Duration::from_secs(8 * 60));
         assert!(st.created.is_some());
+    }
+
+    #[test]
+    fn a_file_the_user_may_not_look_at_still_counts_as_there() {
+        // A missing file is not there; a file that denies access is, and reads as needs-admin.
+        assert!(ring_is_there(Ok(())));
+        assert!(ring_is_there(Err(io::Error::from_raw_os_error(5)))); // ERROR_ACCESS_DENIED
+        assert!(!ring_is_there(Err(io::Error::from_raw_os_error(2)))); // ERROR_FILE_NOT_FOUND
+        assert!(!ring_is_there(Err(io::Error::from_raw_os_error(3)))); // ERROR_PATH_NOT_FOUND
+        let denied = RingError::Io(io::Error::from_raw_os_error(5));
+        assert_eq!(access_from_error(&denied), Access::NeedsAdmin);
+    }
+
+    /// Needs `icacls`, which is on every Windows; makes a real file this user cannot open.
+    #[cfg(windows)]
+    #[test]
+    fn a_ring_the_user_cannot_open_is_chosen_and_reads_as_needs_admin_not_missing() {
+        let dir = Dir::new("denied");
+        let denied = dir.ring();
+        write(&denied, &[sample(0, true)]);
+        let icacls = |args: &[&str]| {
+            std::process::Command::new("icacls")
+                .arg(&dir.0)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+        // Only SYSTEM may use the folder, and the file inside inherits that. (No /T: icacls cannot
+        // recurse into a folder it has just locked itself out of; the change reaches the file anyway.)
+        assert!(icacls(&[
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F"
+        ]));
+        let user = dir.0.join("user.ring");
+        let picked = pick_ring(&denied, &user);
+        let rows = read_rows(&denied, at(0));
+        // Put the permissions back so the folder can be cleaned up, then judge.
+        let restored = icacls(&["/reset", "/T"]);
+        assert!(restored, "could not restore the folder's permissions");
+        assert_eq!(
+            picked, denied,
+            "an unreadable service ring was treated as missing"
+        );
+        assert_eq!(rows.access, Access::NeedsAdmin);
+        assert!(rows.data.is_empty());
+    }
+
+    #[test]
+    fn a_ring_is_stale_after_three_intervals_and_at_least_a_minute() {
+        let secs = Duration::from_secs;
+        assert!(!is_stale(secs(59), 5));
+        assert!(!is_stale(secs(60), 5));
+        assert!(is_stale(secs(61), 5));
+        assert!(!is_stale(secs(180), 60));
+        assert!(is_stale(secs(181), 60));
+        assert!(!is_stale(secs(0), 60));
+    }
+
+    #[test]
+    fn status_says_how_old_the_newest_row_is() {
+        let dir = Dir::new("age");
+        write(&dir.ring(), &[sample(0, true), sample(60, true)]);
+        let st = status(&dir.ring()).data.remove(0);
+        // Judged at fixed moments, so the test does not depend on the clock it runs under.
+        assert_eq!(st.newest_age(at(60 + 30)), Some(Duration::from_secs(30)));
+        assert!(!st.looks_stopped(at(60 + 30)));
+        assert!(st.looks_stopped(at(60 + 3_600)));
+        // A newest row dated after `now` (the clock was set back) has no age and is not called stale.
+        assert_eq!(st.newest_age(at(10)), None);
+        assert!(!st.looks_stopped(at(10)));
+        let empty = Dir::new("age-empty");
+        write(&empty.ring(), &[]);
+        let st = status(&empty.ring()).data.remove(0);
+        assert_eq!(st.newest_age(at(1_000_000)), None);
+        assert!(!st.looks_stopped(at(1_000_000)));
     }
 
     #[test]

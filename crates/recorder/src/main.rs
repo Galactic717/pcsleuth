@@ -308,6 +308,16 @@ mod app {
             println!("oldest row:  {oldest}");
             println!("newest row:  {newest}");
         }
+        let now = Timestamp::now();
+        if let Some(age) = st.newest_age(now) {
+            println!("newest row is {} s old", age.as_secs());
+        }
+        if st.looks_stopped(now) {
+            println!(
+                "warning: the newest row is more than three intervals old, so the recorder is \
+                 probably not running (or the machine was asleep)."
+            );
+        }
         println!(
             "power requests: visible in {} of {} rows{}",
             st.rows - st.rows_without_request_visibility.min(st.rows),

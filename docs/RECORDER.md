@@ -12,6 +12,7 @@ pcsleuth-recorder status                  what the ring holds
 pcsleuth-recorder install                 register the Windows service (elevated prompt); does not start it
 pcsleuth-recorder install --auto-start    the same, starting at boot
 pcsleuth-recorder uninstall               stop and remove the service and delete its ring (elevated prompt)
+pcsleuth-recorder reset                   throw away a damaged ring's history and start a new one
 pcsleuth-recorder --measure 600           run real ticks for 600 s and report the recorder's own cost
 ```
 
@@ -21,6 +22,15 @@ Service Control Manager starts; run from a terminal it refuses and says to use `
 `install` and `uninstall` need an elevated prompt. Without one they print what is needed, change nothing and exit
 with code 5. The service is never installed by anything but `pcsleuth-recorder install`, and `install` does not
 start it: it prints `sc start pcsleuth-recorder`.
+
+**`install` only accepts a program file under `C:\Program Files`.** The service runs as SYSTEM, so whoever can replace
+its program file can run code as SYSTEM at its next start. A copy in a build folder, Downloads or `%LOCALAPPDATA%` is
+writable by any program running as you. So copy `pcsleuth-recorder.exe` into a folder under Program Files (for example
+`C:\Program Files\pcsleuth\`) from an elevated prompt, and run `install` from that copy. Program Files is found with the
+shell's known-folder call, not an environment variable, and both paths are resolved first, so a junction, `..` or a
+change of case does not get a program from elsewhere past it. `install` exits with code 6 and creates nothing otherwise.
+It trusts Windows' default that only administrators can write under Program Files; it does not inspect the permissions
+of the folders in between.
 
 | | `--foreground` | service |
 |---|---|---|
@@ -73,8 +83,19 @@ place) is skipped and counted, and the reader returns `Access::Partial` saying h
 header says counts the missing slots the same way. A file with the wrong magic or version, or a damaged header, is an
 `Access::Failed`, not a panic. A writer opening an existing ring takes the highest valid sequence number from the
 slots, not from the header, so a crash between the slot write and the header write loses nothing and a torn slot is
-overwritten in place. A writer refuses a file that is not a ring (wrong magic or another version) and leaves it
-untouched; a damaged ring of its own, or one of the wrong length, is formatted afresh.
+overwritten in place.
+
+**History is never thrown away silently.** A writer refuses, with the reason and without touching the file, anything
+that is not a healthy ring: wrong magic, another version, a damaged header, or a length that is not what the header says.
+`--foreground` prints the reason and the command to start over; the service stops with error code 13 (see
+`sc query pcsleuth-recorder`), and `pcsleuth-recorder status` shows the reason. Only `pcsleuth-recorder reset` starts a
+new ring, and it still refuses a file that is not a ring of this program, so it cannot wipe an unrelated file. It needs
+the recorder stopped (the ring is open for writing while it runs) and, for the service's ring, an elevated prompt.
+The sequence number never wraps: a ring whose newest slot holds the largest value is refused for writing until reset.
+
+**The writer holds the ring open for reading only by others.** It shares the file for reading and not for writing or
+deleting, so the ring cannot be deleted or renamed out from under it (it would go on writing to a file nobody can
+reach), a second recorder cannot open the same ring, and readers such as `status` and the engine still can.
 
 ## Library API
 
@@ -82,10 +103,10 @@ untouched; a damaged ring of its own, or one of the wrong length, is formatted a
 
 | Function | Returns |
 |---|---|
-| `default_ring_path()` | the service's ring if it exists, else the user's. `service_ring_path()` and `user_ring_path()` give each |
+| `default_ring_path()` | the service's ring if it is there (also when this user may not look at it, which then reads as `NeedsAdmin`, not `Missing`), else the user's. `service_ring_path()` and `user_ring_path()` give each |
 | `read_rows(path, since)` | `Sourced<RecorderRow>`, oldest first, rows at or after `since` |
 | `read_samples(path, since)` | `Sourced<Sample>`: the same rows with `requests_visible` and `truncated` |
-| `status(path)` | `Sourced<Status>`: size, slots, interval, rows, skipped, oldest, newest, how many rows lack request visibility |
+| `status(path)` | `Sourced<Status>`: size, slots, interval, rows, skipped, oldest, newest, how many rows lack request visibility, and `newest_age(now)` / `looks_stopped(now)` (the newest row is older than three intervals and a minute, so the recorder is probably not running, or the machine slept) |
 
 No ring file is `Access::Missing` and a folder the caller cannot read is `Access::NeedsAdmin`, never an error. Damaged
 slots give `Access::Partial` with their count. `read_rows` also gives `Partial` when some rows were recorded without
@@ -96,11 +117,19 @@ empty `power_requests` in a row with `requests_visible == false` must never be r
 ## Who can read the ring
 
 The ring holds process names and the reasons programs give for power requests. The service's folder is created by
-`install` with a protected permission list (nothing inherited from `%ProgramData%`): full control for SYSTEM,
-Administrators and the SID of the user who ran `install`, and nobody else. The ring inherits it. `install` creates the
-folder with that list before it creates the service, so the ring never exists in a readable place. `--foreground` keeps
-its ring under the user's own `%LOCALAPPDATA%`. `uninstall` deletes the ring and the folder. A foreground ring is not
-touched by `uninstall`; delete it by hand.
+`install` with a protected permission list (nothing inherited from `%ProgramData%`): full control for SYSTEM and
+Administrators, and **read only** for the SID of the user who ran `install`, and nobody else. The ring inherits it. The
+user reads their own history but cannot write, rename or delete in a folder that SYSTEM writes in; with full control,
+their unelevated processes could swap the folder for a junction and steer SYSTEM's writes. The folder is found with the
+known-folder call, not `%ProgramData%`. `install` creates the folder with that list before it creates the service, so the
+ring never exists in a readable place, but only after it has checked that no service of that name exists, so a refused
+second install changes nothing.
+
+An existing `%ProgramData%\pcsleuth` is **not trusted**: `install` uses it only if it is a real folder, not a link, owned
+by Administrators or SYSTEM. Otherwise another user could have made it first and kept control of it, or made it a
+junction so that replacing its permissions rewrote those of a folder somewhere else. It is refused untouched, with the
+reason and what to do. `--foreground` keeps its ring under the user's own `%LOCALAPPDATA%`. `uninstall` deletes the ring
+and the folder. A foreground ring is not touched by `uninstall`; delete it by hand.
 
 ## Behaviour that matters for cost
 
@@ -112,7 +141,28 @@ touched by `uninstall`; delete it by hand.
 - The sampling thread runs in `THREAD_MODE_BACKGROUND_BEGIN`: lowest CPU, IO and memory priority.
 - Ticks fall on a fixed grid. After a long tick or a resume from sleep it skips the ticks it missed rather than running
   them in a burst.
-- A process list that cannot be read skips that tick; a failed write is counted and the next tick tries again.
+- A process list that cannot be read skips that tick, and a failed write is counted and tried again at the next tick.
+  After **three failed ticks in a row** (either kind) it gives up instead of staying up and recording nothing: the
+  service reports STOPPED with the error code of the last failure (`sc query pcsleuth-recorder` shows it as
+  WIN32_EXIT_CODE, and the Service Control Manager logs it), and `--foreground` prints it and exits with code 1. A
+  good tick in between starts the count again.
+- `--measure` deletes its ring only if it created it. Given the path of an existing ring with `--ring`, it adds its rows
+  (real samples) to it and leaves it in place.
+
+## Known limits
+
+Found in review and not fixed yet:
+
+- **Wall-clock steps are not flagged.** Rates are computed over the wall-clock time between two samples. If the clock is
+  set backwards, the next row is dropped without a count; if it jumps forwards or backwards by hand or by time sync, the
+  row's `interval_secs` and rates are skewed, and a time-filtered read (`since`) can drop rows whose time went backwards.
+  A sleep is not a step: the row says it covers the whole gap. A fix would compare the wall clock with a monotonic one
+  per tick, count the disagreements, and flag the slots.
+- **A service that cannot register its control handler reports nothing.** If `RegisterServiceCtrlHandlerExW` fails there
+  is no status handle to report through, and the Service Control Manager only times out. The results of
+  `SetServiceStatus` are not checked either. Both are start-up failures of the Windows service machinery, not seen in
+  practice, and neither loses data. A fix would carry the error out of `service_main` so that `run-service` exits
+  with it.
 
 ## Overhead
 
@@ -212,14 +262,19 @@ Written without administrator rights and without installing anything, so the ser
 **Verified, by commands that were run:**
 
 - `cargo test -p pcsleuth-recorder`: the ring (wrap-around, torn write, damaged and misplaced slots, a short file, wrong
-  magic and version, a damaged header, truncation, a seeded fuzz of the decoder, and a real file whose size is
-  byte-identical after about 31 wraps), the sample mapping, the loop, the reading API, and the Windows pieces that need no
-  admin: the SID lookup, the protected folder (a new folder and an existing open one both end with exactly SYSTEM,
-  Administrators and the user, protected, and a file inside inherits them), and a second of waiting costing under 60 ms
-  of thread CPU.
-- The real binary, unelevated: `install` and `uninstall` refuse with exit code 5, say what is needed and change nothing
-  (no service, no folder); `run-service` from a terminal is refused and points to `--foreground`; `status` of a missing
-  ring says so.
+  magic and version, a damaged header or wrong length refused with the history untouched and `reset` as the only way
+  out, truncation, the largest sequence number refused, a seeded fuzz of the decoder, and a real file whose size is
+  byte-identical after about 31 wraps), a real ring that cannot be deleted, renamed or opened by a second writer while
+  open but can be read, the sample mapping, the loop (three failed ticks in a row end it with the error code, a good tick
+  resets the count), the reading API (including a ring this user may not open reading as `NeedsAdmin`, not missing, and
+  the staleness hint), and the Windows pieces that need no admin: the SID lookup, the Program Files check (paths
+  outside it, siblings like `Program Files (x86)`, `..` and case), the protected folder (SYSTEM and Administrators full,
+  the user read only: the user can list it and cannot write in it), an existing folder owned by the user or a junction in
+  its place refused with its target's permissions unchanged, and a second of waiting costing under 60 ms of thread CPU.
+- The real binary, unelevated: `install` and `uninstall` refuse with exit code 5, say what is needed (and that a build
+  folder is not an acceptable place) and change nothing (no service, no folder); `run-service` from a terminal is
+  refused and points to `--foreground`; `status` of a missing ring says so; a damaged ring is refused by `--foreground`
+  with the reason and left byte-identical until `reset`; `--measure` leaves an existing ring in place.
 - `--foreground` for real (`-- --ignored console`, which sends Ctrl+Break): it recorded, stopped cleanly on Ctrl+Break
   with exit code 0, `status` and `read_rows` read back what it wrote, rows said power requests were not visible, and the
   file was exactly 16 777 216 bytes.
@@ -243,6 +298,10 @@ One of them installs, starts, stops and removes the real service, so run it only
 cargo test -p pcsleuth-recorder --test elevated -- --ignored --test-threads=1 --nocapture
 ```
 
-It checks that the service installs for manual start as LocalSystem and is not running, that the folder permissions are
-the intended three, that a second `install` is refused, that after `sc start` rows appear with power requests visible,
-that `sc stop` ends it with the file at its full size, and that `uninstall` leaves no service, ring or folder.
+It copies the recorder into a new folder under Program Files (the only place `install` accepts) and removes it
+afterwards. It checks that `install` from the build folder is refused with exit code 6, that the service installs from
+the copy for manual start as LocalSystem and is not running, that the folder permissions are the intended three, that a
+second `install` is refused without changing the folder's permissions, that after `sc start` rows appear with power
+requests visible, that `sc stop` ends it with the file at its full size, and that `uninstall` leaves no service, ring or
+folder. Not covered even there: the service stopping with an error code after three failed ticks (covered by the loop
+test, not by a real disk failure).
