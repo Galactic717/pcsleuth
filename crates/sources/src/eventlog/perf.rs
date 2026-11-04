@@ -255,7 +255,7 @@ impl PerfCulprit {
             .with_field("name", self.name.as_str())
             .opt("friendly_name", self.friendly_name.as_deref())
             .opt("version", self.version.as_deref())
-            .opt("path", self.path.as_deref())
+            .path("path", self.path.as_deref())
             .opt("product_name", self.product_name.as_deref())
             .opt("company_name", self.company_name.as_deref())
             .opt("start_time", self.start_time)

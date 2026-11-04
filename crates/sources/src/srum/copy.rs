@@ -1,11 +1,9 @@
 //! Getting a readable copy: a private scratch folder, log replay on a copy, and the elevated
 //! snapshot of the live database.
 
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use pcsleuth_core::Access;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -13,38 +11,10 @@ use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use super::ese::{EseError, Instance, Params, database_is_dirty, database_page_size};
+use super::scratch::ScratchDir;
 
 /// The log prefix of the SRUM database (`SRU.log`, `SRU18268.log`, ...).
 const LOG_BASE: &str = "SRU";
-
-/// A folder under the system temp dir that is deleted, with everything in it, on drop.
-pub(super) struct ScratchDir(PathBuf);
-
-impl ScratchDir {
-    pub(super) fn new(tag: &str) -> std::io::Result<ScratchDir> {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let path = std::env::temp_dir().join(format!(
-            "pcsleuth-{tag}-{}-{}-{nanos:x}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path)?;
-        Ok(ScratchDir(path))
-    }
-
-    pub(super) fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Replay the transaction logs next to `db` into `db`, in place. The caller owns the copy: this
 /// rewrites the database and adds log files beside it. Replay is pointed at the copy's folder, so
@@ -89,6 +59,12 @@ impl TempCopy {
     pub fn db_path(&self) -> PathBuf {
         self.dir.path().join("SRUDB.dat")
     }
+
+    /// Delete the copy now and say whether that worked. Dropping a `TempCopy` tries the same but
+    /// has nowhere to report a failure, so call this when a copy that is left behind matters.
+    pub fn close(self) -> Result<(), Access> {
+        self.dir.remove().map_err(|err| io_access(&err))
+    }
 }
 
 /// True when this process has an elevated token.
@@ -129,6 +105,25 @@ pub(super) fn is_srum_log(name: &str) -> bool {
         || (generation.len() == 5 && generation.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// The SRUM log file names among a directory listing, sorted. A listing entry that cannot be read
+/// is an error: a log left out of the copy would make replay fail or start from the wrong place,
+/// so it must not be skipped quietly. A name that is not valid Unicode is not a SRUM log, whose
+/// names are plain ASCII, and is left out.
+fn srum_log_names(
+    entries: impl Iterator<Item = std::io::Result<OsString>>,
+) -> std::io::Result<Vec<String>> {
+    let mut logs = Vec::new();
+    for entry in entries {
+        if let Ok(name) = entry?.into_string()
+            && is_srum_log(&name)
+        {
+            logs.push(name);
+        }
+    }
+    logs.sort();
+    Ok(logs)
+}
+
 /// The system directory from `GetSystemDirectoryW`, not from the `SystemRoot` environment
 /// variable: this runs elevated, and the environment must not choose which `esentutl.exe` does.
 fn system32() -> Result<PathBuf, Access> {
@@ -152,13 +147,10 @@ pub fn snapshot_copy() -> Result<TempCopy, Access> {
     let dir = ScratchDir::new("srum-copy").map_err(|err| io_access(&err))?;
 
     let mut files = vec![String::from("SRUDB.dat")];
-    let mut logs: Vec<String> = std::fs::read_dir(&source)
-        .map_err(|err| io_access(&err))?
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|name| is_srum_log(name))
-        .collect();
-    logs.sort();
-    files.extend(logs);
+    let entries = std::fs::read_dir(&source).map_err(|err| io_access(&err))?;
+    files.extend(
+        srum_log_names(entries.map(|e| e.map(|e| e.file_name()))).map_err(|err| io_access(&err))?,
+    );
 
     for name in &files {
         copy_from_shadow(&esentutl, &source.join(name), &dir.path().join(name))?;
@@ -257,15 +249,40 @@ mod tests {
     }
 
     #[test]
-    fn scratch_dirs_are_unique_and_deleted_on_drop() {
-        let first = ScratchDir::new("test").unwrap();
-        let second = ScratchDir::new("test").unwrap();
-        assert_ne!(first.path(), second.path());
-        let path = first.path().to_path_buf();
-        std::fs::write(path.join("file"), b"x").unwrap();
-        drop(first);
+    fn the_log_list_is_sorted_and_an_unreadable_entry_is_an_error_not_a_gap() {
+        use std::io::{Error, ErrorKind};
+        let name = |n: &str| Ok(OsString::from(n));
+        let listing = vec![
+            name("SRU18269.log"),
+            name("SRUDB.dat"),
+            name("SRU.log"),
+            name("SRU.chk"),
+            name("SRU18268.log"),
+        ];
+        assert_eq!(
+            srum_log_names(listing.into_iter()).unwrap(),
+            ["SRU.log", "SRU18268.log", "SRU18269.log"]
+        );
+        // One entry the directory listing could not read: replay would run with a log missing.
+        let broken = vec![
+            name("SRU.log"),
+            Err(Error::from(ErrorKind::PermissionDenied)),
+            name("SRU18268.log"),
+        ];
+        let err = srum_log_names(broken.into_iter()).unwrap_err();
+        assert_eq!(io_access(&err), Access::NeedsAdmin);
+    }
+
+    #[test]
+    fn a_temp_copy_reports_whether_it_could_be_deleted() {
+        let copy = TempCopy {
+            dir: ScratchDir::new("test").unwrap(),
+        };
+        let path = copy.db_path();
+        std::fs::write(&path, b"x").unwrap();
+        assert!(path.is_file());
+        copy.close().unwrap();
         assert!(!path.exists());
-        assert!(second.path().is_dir());
     }
 
     #[test]

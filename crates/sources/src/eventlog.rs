@@ -20,6 +20,10 @@
 
 #[forbid(unsafe_code)]
 mod apps;
+// Off Windows nothing reads a channel, so only the tests use the bounded-read logic.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[forbid(unsafe_code)]
+mod collect;
 #[forbid(unsafe_code)]
 mod common;
 #[forbid(unsafe_code)]
@@ -42,7 +46,7 @@ mod sched;
 mod testutil;
 
 pub use apps::{AppCrash, AppHang, ApplicationEvent, WerReport};
-pub use common::{Coded, FromRawError, Meta};
+pub use common::{Coded, FromRawError, Meta, collapse_profile_path};
 pub use lifecycle::{
     Bugcheck, EventLogService, LifecycleEvent, OsVersionAtBoot, ServiceState, ShutdownInitiated,
     UnexpectedShutdown,

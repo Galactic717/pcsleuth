@@ -10,7 +10,7 @@ use jiff::civil::DateTime;
 use jiff::tz::TimeZone;
 use pcsleuth_core::{Evidence, SourceId};
 
-use super::common::{EvidenceExt, FromRawError, Meta};
+use super::common::{EvidenceExt, FromRawError, Meta, parameters_text};
 use super::raw::{RawEvent, parse_number};
 
 const EVENT_LOG: &[&str] = &["EventLog"];
@@ -201,16 +201,16 @@ impl ShutdownInitiated {
         self.reason_code.map(|c| c & 0x8000_0000 != 0)
     }
 
+    /// `user` and `comment` are not in the evidence: one names the person and the other is what
+    /// they typed, and neither is needed to say why the machine shut down.
     pub fn to_evidence(&self) -> Evidence {
         self.meta
             .evidence(SYSTEM, 1074)
-            .opt("process", self.process.as_deref())
+            .path("process", self.process.as_deref())
             .opt("reason_code", self.reason_code.map(|c| format!("0x{c:x}")))
             .opt("planned", self.is_planned())
-            .opt("user", self.user.as_deref())
             .opt("reason_text_localized", self.reason_text.as_deref())
             .opt("action_text_localized", self.action_text.as_deref())
-            .opt("comment", self.comment.as_deref())
     }
 }
 
@@ -219,7 +219,9 @@ impl ShutdownInitiated {
 pub struct Bugcheck {
     pub meta: Meta,
     pub code: u32,
-    pub parameters: Vec<u64>,
+    /// The parameters in the order Windows wrote them. `None` marks one that is not a hex number,
+    /// so the ones after it keep their position. Empty trailing slots are dropped.
+    pub parameters: Vec<Option<u64>>,
     pub dump_path: Option<String>,
     pub report_id: Option<String>,
 }
@@ -240,30 +242,25 @@ impl Bugcheck {
             .flatten()
             .and_then(|n| u32::try_from(n).ok())
             .ok_or(FromRawError::MissingField("param1"))?;
+        let mut parameters: Vec<Option<u64>> = numbers.collect();
+        while parameters.last() == Some(&None) {
+            parameters.pop();
+        }
         Ok(Self {
             meta,
             code,
-            parameters: numbers.map_while(|n| n).collect(),
+            parameters,
             dump_path: raw.text("param2"),
             report_id: raw.text("param3"),
         })
     }
 
     pub fn to_evidence(&self) -> Evidence {
-        let params = self
-            .parameters
-            .iter()
-            .map(|p| format!("0x{p:x}"))
-            .collect::<Vec<_>>()
-            .join(", ");
         self.meta
             .evidence(SYSTEM, 1001)
             .with_field("bugcheck_code", format!("0x{:08x}", self.code))
-            .opt(
-                "bugcheck_parameters",
-                (!params.is_empty()).then_some(params),
-            )
-            .opt("dump_path", self.dump_path.as_deref())
+            .opt("bugcheck_parameters", parameters_text(&self.parameters))
+            .path("dump_path", self.dump_path.as_deref())
             .opt("report_id", self.report_id.as_deref())
     }
 }
@@ -435,6 +432,33 @@ mod tests {
     }
 
     #[test]
+    fn user32_1074_evidence_leaves_out_the_person_and_collapses_the_profile_path() {
+        let mut raw = record("user32-1074.xml", 365158);
+        for d in &mut raw.data {
+            match d.name.as_deref() {
+                Some("param1") => {
+                    d.value = r"C:\Users\alice\AppData\Local\Setup\setup.exe (PC)".into()
+                }
+                Some("param2") => d.value = "PC".into(),
+                Some("param6") => d.value = "restarting for alice's update".into(),
+                Some("param7") => d.value = r"PC\alice".into(),
+                _ => {}
+            }
+        }
+        let r = ShutdownInitiated::from_raw(&raw).unwrap();
+        // The typed event keeps them; the evidence does not.
+        assert_eq!(r.user.as_deref(), Some(r"PC\alice"));
+        assert!(r.comment.is_some());
+        let e = r.to_evidence();
+        assert_eq!(
+            e.fields["process"],
+            r"%USERPROFILE%\AppData\Local\Setup\setup.exe"
+        );
+        assert!(!e.fields.contains_key("user") && !e.fields.contains_key("comment"));
+        assert!(e.fields.values().all(|v| !v.contains("alice")));
+    }
+
+    #[test]
     fn user32_1074_planned_flag_and_missing_process() {
         let mut raw = record("user32-1074.xml", 365158);
         for d in &mut raw.data {
@@ -463,10 +487,10 @@ mod tests {
         assert_eq!(
             b.parameters,
             [
-                3,
-                0xffff_a30f_1234_5678,
-                0xffff_f801_2345_0000,
-                0xffff_a30f_2345_6789
+                Some(3),
+                Some(0xffff_a30f_1234_5678),
+                Some(0xffff_f801_2345_0000),
+                Some(0xffff_a30f_2345_6789)
             ]
         );
         assert_eq!(b.dump_path.as_deref(), Some(r"C:\Windows\MEMORY.DMP"));
@@ -485,6 +509,33 @@ mod tests {
             Bugcheck::from_raw(&garbage),
             Err(FromRawError::MissingField("param1"))
         );
+    }
+
+    #[test]
+    fn bugcheck_parameters_keep_their_position_when_one_is_unreadable() {
+        let mut raw = fixture_events("synthetic-wer-systemerrorreporting-1001.xml").remove(0);
+        let set_param1 = |raw: &mut RawEvent, text: &str| {
+            for d in &mut raw.data {
+                if d.name.as_deref() == Some("param1") {
+                    d.value = text.into();
+                }
+            }
+        };
+        set_param1(&mut raw, "0x0000009f (0x3, garbage, 0x5, 0x6)");
+        let b = Bugcheck::from_raw(&raw).unwrap();
+        assert_eq!(b.parameters, [Some(3), None, Some(5), Some(6)]);
+        assert_eq!(
+            b.to_evidence().fields["bugcheck_parameters"],
+            "0x3, ?, 0x5, 0x6"
+        );
+        // Unreadable ones at the end are dropped, not guessed.
+        set_param1(&mut raw, "0x0000009f (0x3, 0x4, nope)");
+        let b = Bugcheck::from_raw(&raw).unwrap();
+        assert_eq!(b.parameters, [Some(3), Some(4)]);
+        set_param1(&mut raw, "0x0000009f (nope, nope)");
+        let b = Bugcheck::from_raw(&raw).unwrap();
+        assert!(b.parameters.is_empty());
+        assert!(!b.to_evidence().fields.contains_key("bugcheck_parameters"));
     }
 
     #[test]

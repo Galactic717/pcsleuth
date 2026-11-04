@@ -38,6 +38,9 @@ pub(super) struct Shape {
     pub unreadable_energy_row: bool,
     /// End the instance abruptly so the file is a dirty shutdown with its logs beside it.
     pub dirty: bool,
+    /// Add rows a damaged database could hold: resource rows with no time and no app id, one with
+    /// a negative and a null counter, and an id map entry far larger than any real name.
+    pub damaged_rows: bool,
 }
 
 /// An OLE Automation date for an RFC 3339 time, as SRUM stores `TimeStamp`.
@@ -91,9 +94,9 @@ pub(super) fn build(dir: &Path, shape: Shape) -> PathBuf {
         table.insert(&[("Id", int(1))]).unwrap();
     } else {
         if !shape.no_id_map {
-            fill_id_map(&database);
+            fill_id_map(&database, shape);
         }
-        fill_resource(&database);
+        fill_resource(&database, shape);
         fill_network(&database, shape);
         if !shape.no_energy_table {
             fill_energy(&database, shape);
@@ -110,7 +113,7 @@ pub(super) fn build(dir: &Path, shape: Shape) -> PathBuf {
     db
 }
 
-fn fill_id_map(database: &super::ese::build::WritableDatabase<'_, '_>) {
+fn fill_id_map(database: &super::ese::build::WritableDatabase<'_, '_>, shape: Shape) {
     let table = database
         .create_table(
             ID_MAP,
@@ -121,7 +124,7 @@ fn fill_id_map(database: &super::ese::build::WritableDatabase<'_, '_>) {
             ],
         )
         .unwrap();
-    let rows = [
+    let mut rows = vec![
         (0, 0, Vec::new()), // the empty entry real databases start with
         (0, ALPHA_ID, utf16z(ALPHA)),
         (0, BETA_ID, utf16z(BETA)),
@@ -129,6 +132,9 @@ fn fill_id_map(database: &super::ese::build::WritableDatabase<'_, '_>) {
         (3, USER_ID, sid_bytes(&[21, 1111, 2222, 3333, 1001])),
         (3, SYSTEM_ID, sid_bytes(&[18])),
     ];
+    if shape.damaged_rows {
+        rows.push((0, 99, vec![0xAB; 10_000]));
+    }
     for (id_type, index, blob) in rows {
         table
             .insert(&[
@@ -150,7 +156,7 @@ struct Resource {
     written: (i64, i64),
 }
 
-fn fill_resource(database: &super::ese::build::WritableDatabase<'_, '_>) {
+fn fill_resource(database: &super::ese::build::WritableDatabase<'_, '_>, shape: Shape) {
     let table = database
         .create_table(
             RESOURCE,
@@ -253,6 +259,32 @@ fn fill_resource(database: &super::ese::build::WritableDatabase<'_, '_>) {
                 ("BackgroundBytesWritten", int(row.written.1)),
             ])
             .unwrap();
+    }
+    if shape.damaged_rows {
+        let zeros = [
+            ("ForegroundBytesRead", int(0)),
+            ("ForegroundBytesWritten", int(0)),
+            ("BackgroundBytesRead", int(0)),
+            ("BackgroundBytesWritten", int(0)),
+        ];
+        let at = |text| ("TimeStamp", Value::Date(ole(text)));
+        // No time at all.
+        let mut row = vec![("AppId", int(ALPHA_ID)), ("UserId", int(USER_ID))];
+        row.extend(zeros.clone());
+        table.insert(&row).unwrap();
+        // A time in the window but no app id.
+        let mut row = vec![at("2026-11-03T12:00:00Z"), ("UserId", int(USER_ID))];
+        row.extend(zeros.clone());
+        table.insert(&row).unwrap();
+        // A negative foreground counter, and no value at all for the background one.
+        let mut row = vec![
+            at("2026-11-03T12:30:00Z"),
+            ("AppId", int(ALPHA_ID)),
+            ("UserId", int(USER_ID)),
+            ("ForegroundCycleTime", int(-5)),
+        ];
+        row.extend(zeros);
+        table.insert(&row).unwrap();
     }
 }
 

@@ -9,7 +9,9 @@
 use jiff::Timestamp;
 use pcsleuth_core::{Evidence, SourceId};
 
-use super::common::{EvidenceExt, FromRawError, Meta, coded_enum, number_or_bool, req_u32};
+use super::common::{
+    EvidenceExt, FromRawError, Meta, coded_enum, number_or_bool, parameters_text, req_u32,
+};
 use super::raw::RawEvent;
 
 const POWER_TROUBLESHOOTER: &[&str] = &["Microsoft-Windows-Power-Troubleshooter"];
@@ -239,7 +241,9 @@ impl SleepResumed {
 pub struct UncleanReboot {
     pub meta: Meta,
     pub bugcheck_code: Option<u32>,
-    pub bugcheck_parameters: Vec<u64>,
+    /// `BugcheckParameter1` to `4` in order. `None` marks one the record lacks, so the ones after
+    /// it keep their position. Trailing absent ones are dropped.
+    pub bugcheck_parameters: Vec<Option<u64>>,
     /// Zero when no sleep was in progress. A boolean `true` reads as 1.
     pub sleep_in_progress: Option<u32>,
     pub power_button_pressed: Option<Timestamp>,
@@ -251,12 +255,16 @@ pub struct UncleanReboot {
 impl UncleanReboot {
     pub fn from_raw(raw: &RawEvent) -> Result<Self, FromRawError> {
         let meta = Meta::expect(raw, "Kernel-Power 41", KERNEL_POWER, &[41])?;
+        let mut bugcheck_parameters: Vec<Option<u64>> = (1..=4)
+            .map(|n| raw.u64(&format!("BugcheckParameter{n}")))
+            .collect();
+        while bugcheck_parameters.last() == Some(&None) {
+            bugcheck_parameters.pop();
+        }
         Ok(Self {
             meta,
             bugcheck_code: raw.u32("BugcheckCode"),
-            bugcheck_parameters: (1..=4)
-                .filter_map(|n| raw.u64(&format!("BugcheckParameter{n}")))
-                .collect(),
+            bugcheck_parameters,
             sleep_in_progress: number_or_bool(raw, "SleepInProgress"),
             power_button_pressed: raw.filetime("PowerButtonTimestamp"),
             connected_standby_in_progress: raw.bool("ConnectedStandbyInProgress"),
@@ -271,12 +279,6 @@ impl UncleanReboot {
     }
 
     pub fn to_evidence(&self) -> Evidence {
-        let params = self
-            .bugcheck_parameters
-            .iter()
-            .map(|p| format!("0x{p:x}"))
-            .collect::<Vec<_>>()
-            .join(", ");
         self.meta
             .evidence(SYSTEM, 41)
             .opt(
@@ -285,7 +287,7 @@ impl UncleanReboot {
             )
             .opt(
                 "bugcheck_parameters",
-                (!params.is_empty()).then_some(params),
+                parameters_text(&self.bugcheck_parameters),
             )
             .opt("sleep_in_progress", self.sleep_in_progress)
             .opt("power_button_pressed", self.power_button_pressed)
@@ -806,8 +808,27 @@ mod tests {
         );
         assert_eq!(reboots[1].sleep_in_progress, Some(0));
         assert_eq!(reboots[1].power_button_pressed, None);
-        assert_eq!(reboots[0].bugcheck_parameters, [0, 0, 0, 0]);
+        assert_eq!(
+            reboots[0].bugcheck_parameters,
+            [Some(0), Some(0), Some(0), Some(0)]
+        );
         assert_eq!(reboots[0].checkpoint, Some(16));
+    }
+
+    #[test]
+    fn kernel_power_41_parameters_keep_their_position_when_one_is_absent() {
+        let mut raw = fixture_events("synthetic-kernel-power-41-versions.xml").remove(2);
+        let full = UncleanReboot::from_raw(&raw).unwrap().bugcheck_parameters;
+        assert!(full.iter().all(Option::is_some) && full.len() == 4);
+        raw.data
+            .retain(|d| d.name.as_deref() != Some("BugcheckParameter2"));
+        let gap = UncleanReboot::from_raw(&raw).unwrap();
+        assert_eq!(gap.bugcheck_parameters, [full[0], None, full[2], full[3]]);
+        assert!(gap.to_evidence().fields["bugcheck_parameters"].contains(", ?, "));
+        raw.data
+            .retain(|d| d.name.as_deref() != Some("BugcheckParameter4"));
+        let short = UncleanReboot::from_raw(&raw).unwrap();
+        assert_eq!(short.bugcheck_parameters, [full[0], None, full[2]]);
     }
 
     /// Versions 0 to 10 of event 41 differ. Built from the manifest, not real validation.
@@ -831,7 +852,7 @@ mod tests {
         assert!(parsed[2].bugcheck_recorded());
         assert_eq!(parsed[2].bugcheck_code, Some(0x9f));
         assert_eq!(parsed[2].bugcheck_parameters.len(), 4);
-        assert_eq!(parsed[2].bugcheck_parameters[0], 3);
+        assert_eq!(parsed[2].bugcheck_parameters[0], Some(3));
         // v3 and later write a number.
         assert_eq!(parsed[3].sleep_in_progress, Some(4));
         assert_eq!(parsed[4].connected_standby_in_progress, Some(true));
