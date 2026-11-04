@@ -37,7 +37,12 @@ This is what the engine must emit for a finding to count. It is the only thing t
 Rules the scorer applies:
 
 - Only a **confident** finding can name a cause: confidence `recorded`, `correlated` or `sampled`. A
-  `not_recorded` finding has no evidence by construction, so it cannot.
+  `not_recorded` finding may cite the record that shows the gap, but the scorer ignores it, so it
+  cannot name a cause.
+- Only the **first** piece of evidence of a finding can name a cause. Later pieces are context. A
+  ranked answer ("busiest right now: A, B, C, D, E") therefore names A and nobody else, so a hog
+  listed fifth is not named. For `cpu-hog-live` and `disk-hog-live` a low-activity decoy
+  (`pcsleuth-fault-idle`) runs beside the hog, and naming it first is a false attribution.
 - When the scenario produced an event, it knows the record ids. A finding counts only if the evidence naming the
   cause **cites one of those ids**. The same exe naming an older record does not count, and is a false
   attribution. This is why a crash finding is matched to the right event and not to an earlier run of the same
@@ -85,6 +90,7 @@ All are bounded in time, need no admin, change no setting, and print `ready` on 
 | `pcsleuth-fault-disk` | Paced `write` + `sync_data` | Default 20 s, 256 MiB total, 32 MiB/s. Hard caps 1024 MiB and 256 MiB/s. Writes only under `%TEMP%\pcsleuth-fault-disk-<pid>`, deleted on exit, and deleted again by the runner if the hog was killed first |
 | `pcsleuth-fault-crash` | `RaiseException(0xC0000005)` with no handler: Application Error 1000 | Exits after 1 s |
 | `pcsleuth-fault-hang` | A visible window whose thread stops pumping messages: Application Hang 1002 (see below) | Default 60 s |
+| `pcsleuth-fault-idle` | Nothing: stays alive and does no work. Runs beside the CPU and disk hogs as a decoy | Default 30 s, ends by itself |
 
 What was verified about them, on the laptop described under Results:
 

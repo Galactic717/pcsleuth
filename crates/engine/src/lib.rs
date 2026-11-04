@@ -1,98 +1,166 @@
 //! One function per question, each returning an [`Answer`].
 //!
-//! Stubs for now: every question returns one honest "not recorded" finding saying it is not
-//! implemented yet. The engine package replaces the bodies; the signatures are what the command
-//! line and the app call.
+//! Each question is split in two. A pure function turns what the sources returned into findings
+//! (the modules [`wake`], [`nosleep`], [`battery`], [`crash`], [`slow`], [`now`], [`timeline`] and
+//! [`doctor`]) and is tested over `fixtures/`. A thin step in `gather` reads the sources and hands
+//! them over. The functions at the crate root are the two joined, and are what the command line
+//! and the app call.
+//!
+//! The rule that shapes every finding: never state a cause Windows did not state. `Recorded`
+//! only when a record says it, `Correlated` only with a cited nearby record and the word
+//! "likely", `Sampled` only from the recorder with its interval, and `not recorded` with what
+//! would capture it otherwise.
 #![forbid(unsafe_code)]
 
-use jiff::Timestamp;
-use pcsleuth_core::{Answer, Finding, NotRecorded, Question};
+pub mod battery;
+pub mod common;
+pub mod crash;
+pub mod doctor;
+mod gather;
+pub mod live;
+pub mod nosleep;
+pub mod now;
+pub mod recorded;
+pub mod slow;
+pub mod timeline;
+pub mod wake;
+
+pub use common::{Window, collapse_sids};
+
+use jiff::{SignedDuration, Timestamp};
+use pcsleuth_core::{Answer, Question};
 
 /// What the caller asked for. Fields may be added; build it with `Options::default()` and set fields.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct Options {
-    /// Only use evidence at or after this time.
+    /// Only use evidence at or after this time. Defaults to [`default_lookback`] before now.
     pub since: Option<Timestamp>,
-    /// Return at most this many findings, keeping the most recent.
+    /// Show at most this many dated findings, keeping the most recent. Defaults to
+    /// [`default_limit`]. Findings with no date (live state, "not recorded" notes) are always shown.
     pub limit: Option<usize>,
 }
 
+/// The window an answer used, and whether it came from the caller or from a default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resolved {
+    pub window: Window,
+    pub since_is_default: bool,
+    pub limit_is_default: bool,
+}
+
+/// How far back a question looks when `--since` is not given.
+pub fn default_lookback(question: Question) -> SignedDuration {
+    match question {
+        // Crashes are rare enough that a week often shows none.
+        Question::Crash => SignedDuration::from_hours(30 * 24),
+        _ => SignedDuration::from_hours(7 * 24),
+    }
+}
+
+/// How many dated findings a question shows when `--limit` is not given.
+pub fn default_limit(question: Question) -> usize {
+    match question {
+        Question::Timeline => 50,
+        _ => 20,
+    }
+}
+
+/// The window for `question` at `now`, with defaults filled in.
+pub fn resolve(question: Question, options: &Options, now: Timestamp) -> Resolved {
+    let default_since = now
+        .checked_sub(default_lookback(question))
+        .unwrap_or(Timestamp::UNIX_EPOCH);
+    Resolved {
+        window: Window {
+            now,
+            since: options.since.unwrap_or(default_since),
+            limit: options.limit.unwrap_or_else(|| default_limit(question)),
+        },
+        since_is_default: options.since.is_none(),
+        limit_is_default: options.limit.is_none(),
+    }
+}
+
+fn window(question: Question, options: &Options) -> Window {
+    resolve(question, options, Timestamp::now()).window
+}
+
 pub fn wake(options: &Options) -> Answer {
-    not_implemented(Question::Wake, options)
+    let w = window(Question::Wake, options);
+    wake::answer(&gather::wake_input(&w), &w)
 }
 
 pub fn nosleep(options: &Options) -> Answer {
-    not_implemented(Question::NoSleep, options)
+    let w = window(Question::NoSleep, options);
+    nosleep::answer(&gather::nosleep_input(&w), &w)
 }
 
 pub fn battery(options: &Options) -> Answer {
-    not_implemented(Question::Battery, options)
+    let w = window(Question::Battery, options);
+    battery::answer(&gather::battery_input(&w), &w)
 }
 
 pub fn crash(options: &Options) -> Answer {
-    not_implemented(Question::Crash, options)
+    let w = window(Question::Crash, options);
+    crash::answer(&gather::crash_input(&w), &w)
 }
 
 pub fn slow(options: &Options) -> Answer {
-    not_implemented(Question::Slow, options)
+    let w = window(Question::Slow, options);
+    slow::answer(&gather::slow_input(&w), &w)
 }
 
 pub fn now(options: &Options) -> Answer {
-    not_implemented(Question::Now, options)
+    let w = window(Question::Now, options);
+    now::answer(&gather::now_input(), &w)
 }
 
 pub fn timeline(options: &Options) -> Answer {
-    not_implemented(Question::Timeline, options)
+    let w = window(Question::Timeline, options);
+    timeline::answer(&gather::timeline_input(&w), &w)
 }
 
 pub fn doctor(options: &Options) -> Answer {
-    not_implemented(Question::Doctor, options)
-}
-
-fn not_implemented(question: Question, _options: &Options) -> Answer {
-    let finding = Finding::not_recorded(
-        format!("{question}.not_implemented"),
-        question,
-        format!("The {question} question is not implemented yet"),
-        "This build of pcsleuth has the answer format and the command line, but does not read \
-         any logs for this question yet.",
-        NotRecorded::new(
-            format!("the answer to the {question} question"),
-            "a release whose engine reads the sources listed for this question in docs/PLAN.md",
-        ),
-    )
-    .expect("the stub text is fixed and not blank");
-    Answer::new(question, Timestamp::now(), vec![finding], Vec::new())
+    let w = window(Question::Doctor, options);
+    doctor::answer(&gather::doctor_input(&w), &w)
 }
 
 #[cfg(test)]
 mod tests {
-    use pcsleuth_core::Confidence;
-
     use super::*;
 
+    fn at(text: &str) -> Timestamp {
+        text.parse().unwrap()
+    }
+
     #[test]
-    fn every_question_says_it_is_not_implemented() {
-        let options = Options::default();
-        type Ask = fn(&Options) -> Answer;
-        let questions: [(Question, Ask); 8] = [
-            (Question::Wake, wake),
-            (Question::NoSleep, nosleep),
-            (Question::Battery, battery),
-            (Question::Crash, crash),
-            (Question::Slow, slow),
-            (Question::Now, now),
-            (Question::Timeline, timeline),
-            (Question::Doctor, doctor),
-        ];
-        for (question, ask) in questions {
-            let answer = ask(&options);
-            assert_eq!(answer.question, question);
-            assert_eq!(answer.findings.len(), 1);
-            let finding = &answer.findings[0];
-            assert_eq!(finding.confidence(), Confidence::NotRecorded);
-            assert_eq!(finding.id(), format!("{question}.not_implemented"));
-        }
+    fn defaults_are_a_week_back_and_twenty_findings() {
+        let now = at("2026-11-04T09:00:00Z");
+        let resolved = resolve(Question::Wake, &Options::default(), now);
+        assert_eq!(resolved.window.since, at("2026-10-28T09:00:00Z"));
+        assert_eq!(resolved.window.limit, 20);
+        assert!(resolved.since_is_default && resolved.limit_is_default);
+    }
+
+    #[test]
+    fn crashes_look_back_a_month_and_the_timeline_shows_more() {
+        let now = at("2026-11-04T09:00:00Z");
+        let crash = resolve(Question::Crash, &Options::default(), now);
+        assert_eq!(crash.window.since, at("2026-10-05T09:00:00Z"));
+        let timeline = resolve(Question::Timeline, &Options::default(), now);
+        assert_eq!(timeline.window.limit, 50);
+    }
+
+    #[test]
+    fn what_the_caller_asked_for_wins_and_is_not_marked_default() {
+        let options = Options {
+            since: Some(at("2026-11-01T00:00:00Z")),
+            limit: Some(3),
+        };
+        let resolved = resolve(Question::Slow, &options, at("2026-11-04T09:00:00Z"));
+        assert_eq!(resolved.window.since, at("2026-11-01T00:00:00Z"));
+        assert_eq!(resolved.window.limit, 3);
+        assert!(!resolved.since_is_default && !resolved.limit_is_default);
     }
 }

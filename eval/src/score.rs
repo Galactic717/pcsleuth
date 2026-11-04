@@ -2,7 +2,8 @@
 //!
 //! No clock, no OS, no I/O. The attribution contract the engine follows: a finding names a cause
 //! by putting the exe name in `Evidence.fields["process"]` or a device name in
-//! `Evidence.fields["device"]`. Prose is never read.
+//! `Evidence.fields["device"]` on the first piece of evidence of a finding. Later pieces are
+//! context, so a ranked answer names who is first and nobody else. Prose is never read.
 
 use std::collections::BTreeSet;
 
@@ -152,7 +153,9 @@ pub fn score(expect: &Expect, observable: &Observable, answer: Option<&Answer>) 
         if finding.confidence() == Confidence::NotRecorded {
             continue;
         }
-        for evidence in finding.evidence() {
+        // A ranked answer ("busiest right now: A, B, C") names who is first. The rest of its
+        // evidence is context, so a hog listed fifth is not named.
+        for evidence in finding.evidence().iter().take(1) {
             for cause in causes(evidence) {
                 if cause != expect.cause {
                     other.insert(cause);
@@ -337,6 +340,71 @@ mod tests {
         let scored = score(&expect(&["42"]), &Observable::Yes, Some(&a));
         assert_eq!(scored.outcome, Outcome::TruePositive);
         assert_eq!(scored.extras, 0);
+    }
+
+    fn running(name: &str) -> Evidence {
+        ev(SourceId::Processes, PROCESS_FIELD, name)
+    }
+
+    fn hog() -> Expect {
+        Expect {
+            cause: Cause::process("pcsleuth-fault-cpu"),
+            record_ids: vec![],
+            since: None,
+        }
+    }
+
+    #[test]
+    fn a_ranked_answer_attributes_its_first_entry_and_not_the_fifth() {
+        let ranked = |names: [&str; 5]| {
+            answer(
+                vec![recorded("now.top_cpu", names.map(running).to_vec())],
+                vec![],
+            )
+        };
+        let first = ranked(["pcsleuth-fault-cpu.exe", "a.exe", "b.exe", "c.exe", "d.exe"]);
+        let scored = score(&hog(), &Observable::Yes, Some(&first));
+        assert_eq!(scored.outcome, Outcome::TruePositive);
+        // The other four are context, not extra attributions.
+        assert_eq!(scored.extras, 0);
+
+        let fifth = ranked(["a.exe", "b.exe", "c.exe", "d.exe", "pcsleuth-fault-cpu.exe"]);
+        let scored = score(&hog(), &Observable::Yes, Some(&fifth));
+        assert_eq!(scored.outcome, Outcome::FalseAttribution);
+        assert_eq!(scored.named, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn a_low_activity_decoy_named_first_is_a_false_attribution() {
+        let decoy_first = answer(
+            vec![recorded(
+                "now.top_cpu",
+                vec![
+                    running("pcsleuth-fault-idle.exe"),
+                    running("pcsleuth-fault-cpu.exe"),
+                ],
+            )],
+            vec![],
+        );
+        let scored = score(&hog(), &Observable::Yes, Some(&decoy_first));
+        assert_eq!(scored.outcome, Outcome::FalseAttribution);
+        assert_eq!(scored.named, vec!["pcsleuth-fault-idle".to_string()]);
+
+        // Naming the hog first, with the decoy behind it, is right.
+        let hog_first = answer(
+            vec![recorded(
+                "now.top_cpu",
+                vec![
+                    running("pcsleuth-fault-cpu.exe"),
+                    running("pcsleuth-fault-idle.exe"),
+                ],
+            )],
+            vec![],
+        );
+        assert_eq!(
+            outcome(&hog(), &Observable::Yes, &hog_first),
+            Outcome::TruePositive
+        );
     }
 
     #[test]

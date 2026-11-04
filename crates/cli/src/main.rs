@@ -4,24 +4,28 @@
 //! 2 on bad usage (clap).
 #![forbid(unsafe_code)]
 
+mod elevate;
 mod render;
 mod since;
 
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use pcsleuth_core::Answer;
-use pcsleuth_engine::Options;
+use pcsleuth_core::{Answer, Question};
+use pcsleuth_engine::{Options, resolve};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "pcsleuth",
     version,
-    about = "Ask your Windows PC why it did that."
+    about = "Ask your Windows PC why it did that.",
+    after_help = "Without --since, wake, nosleep, battery, slow and timeline look back 7 days and \
+                  crash looks back 30. Without --limit, 20 dated findings are shown (timeline 50)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -35,7 +39,8 @@ struct Cli {
     #[arg(long, global = true, value_name = "WHEN", value_parser = since::parse)]
     since: Option<Timestamp>,
 
-    /// Show at most this many findings, keeping the most recent.
+    /// Show at most this many dated findings: the more serious kinds first, then the newest of
+    /// each kind. Notes with no date are always shown, and one says what was left out.
     #[arg(
         long,
         global = true,
@@ -44,9 +49,14 @@ struct Cli {
     )]
     limit: Option<u32>,
 
-    /// Re-run elevated through UAC to read the sources that need admin (not implemented yet).
+    /// Run again elevated through the Windows permission prompt, to read what needs admin.
     #[arg(long, global = true)]
     elevate: bool,
+
+    /// Where the elevated copy writes its JSON answer. Only `--elevate` uses this, and it only
+    /// accepts a file inside a folder the first run made for it.
+    #[arg(long = "out-file", global = true, hide = true, value_name = "PATH")]
+    out_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Subcommand)]
@@ -63,10 +73,25 @@ enum Command {
     Slow,
     /// What is it doing right now?
     Now,
-    /// Everything above, merged and sorted by time.
+    /// Everything above that the logs hold, merged and sorted by time.
     Timeline,
     /// Which sources can be read, and what elevation would add.
     Doctor,
+}
+
+impl Command {
+    fn question(self) -> Question {
+        match self {
+            Command::Wake => Question::Wake,
+            Command::Nosleep => Question::NoSleep,
+            Command::Battery => Question::Battery,
+            Command::Crash => Question::Crash,
+            Command::Slow => Question::Slow,
+            Command::Now => Question::Now,
+            Command::Timeline => Question::Timeline,
+            Command::Doctor => Question::Doctor,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -82,20 +107,37 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
-    if cli.elevate {
-        let _ = writeln!(io::stderr(), "pcsleuth: --elevate is not implemented yet");
-        return Ok(ExitCode::FAILURE);
-    }
-
     let mut options = Options::default();
     options.since = cli.since;
     options.limit = cli.limit.map(|limit| limit as usize);
+    let question = cli.command.question();
 
-    let answer = ask(cli.command, &options);
+    // The elevated copy: answer in JSON into the file the first run made, and print nothing.
+    if let Some(path) = &cli.out_file {
+        return write_answer_file(&ask(cli.command, &options), path);
+    }
+
+    let answer = if cli.elevate && !elevate::already_elevated() {
+        let args = elevate::child_args(question.as_str(), cli.since, cli.limit);
+        match elevate::fetch(&args) {
+            Ok(answer) => answer,
+            Err(why) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "pcsleuth: could not run elevated ({why}); showing the answer without admin"
+                );
+                ask(cli.command, &options)
+            }
+        }
+    } else {
+        ask(cli.command, &options)
+    };
+
     let text = if cli.json {
         render::json(&answer)?
     } else {
-        render::human(&answer, &TimeZone::system())
+        let scope = resolve(question, &options, answer.generated_at);
+        render::human(&answer, &TimeZone::system(), Some(&scope))
     };
     write_stdout(&text)?;
     Ok(ExitCode::SUCCESS)
@@ -112,6 +154,23 @@ fn ask(command: Command, options: &Options) -> Answer {
         Command::Timeline => pcsleuth_engine::timeline(options),
         Command::Doctor => pcsleuth_engine::doctor(options),
     }
+}
+
+/// Write the answer as JSON to `path`, a new file inside a folder the first run made. Anything
+/// else is refused, so an elevated write can only land where the first run chose.
+fn write_answer_file(answer: &Answer, path: &Path) -> anyhow::Result<ExitCode> {
+    if !pcsleuth_sources::power::is_output_path(path) {
+        anyhow::bail!(
+            "--out-file must be a file inside a folder named pcsleuth- and 32 hex digits"
+        );
+    }
+    let text = render::json(answer)?;
+    let mut file = pcsleuth_sources::power::open_output_file(path)
+        .with_context(|| format!("could not create {}", path.display()))?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.flush())
+        .context("could not write the answer")?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Write without `println!`, which panics when the pipe closes early (`pcsleuth wake | head`).

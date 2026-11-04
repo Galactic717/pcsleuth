@@ -14,16 +14,19 @@ pub enum Fault {
     Disk,
     Crash,
     Hang,
+    /// Does nothing. Runs beside a hog as a decoy: naming it first is a false attribution.
+    Idle,
 }
 
 impl Fault {
-    pub const ALL: [Fault; 6] = [
+    pub const ALL: [Fault; 7] = [
         Fault::PowerRequest,
         Fault::WakeTimer,
         Fault::Cpu,
         Fault::Disk,
         Fault::Crash,
         Fault::Hang,
+        Fault::Idle,
     ];
 
     /// The exe base name, `pcsleuth-fault-cpu` for `pcsleuth-fault-cpu.exe`.
@@ -35,6 +38,7 @@ impl Fault {
             Fault::Disk => "pcsleuth-fault-disk",
             Fault::Crash => "pcsleuth-fault-crash",
             Fault::Hang => "pcsleuth-fault-hang",
+            Fault::Idle => "pcsleuth-fault-idle",
         }
     }
 
@@ -47,10 +51,12 @@ impl Fault {
 #[derive(Debug, Clone, Copy)]
 pub enum Inject {
     /// The fault is running when the question is asked. `settle_secs` lets a sampler see it.
+    /// `decoy`, when set, runs beside it for the same time and is not the cause.
     Live {
         fault: Fault,
         secs: u64,
         settle_secs: u64,
+        decoy: Option<Fault>,
     },
     /// The fault ran for `secs` and has exited when the question is asked.
     Past { fault: Fault, secs: u64 },
@@ -160,6 +166,7 @@ pub const SCENARIOS: &[Scenario] = &[
             fault: Fault::Cpu,
             secs: 40,
             settle_secs: 4,
+            decoy: Some(Fault::Idle),
         },
         needs: Needs::Nothing,
     },
@@ -171,6 +178,7 @@ pub const SCENARIOS: &[Scenario] = &[
             fault: Fault::Disk,
             secs: 40,
             settle_secs: 3,
+            decoy: Some(Fault::Idle),
         },
         needs: Needs::Nothing,
     },
@@ -183,6 +191,7 @@ pub const SCENARIOS: &[Scenario] = &[
             fault: Fault::PowerRequest,
             secs: 40,
             settle_secs: 1,
+            decoy: None,
         },
         needs: Needs::Admin {
             limit: SourceId::PowerRequests,
@@ -198,6 +207,7 @@ pub const SCENARIOS: &[Scenario] = &[
             fault: Fault::WakeTimer,
             secs: 40,
             settle_secs: 1,
+            decoy: None,
         },
         needs: Needs::Admin {
             limit: SourceId::WakeTimers,
@@ -302,6 +312,20 @@ mod tests {
         let exes: BTreeSet<_> = Fault::ALL.iter().map(|f| f.exe()).collect();
         assert_eq!(exes.len(), Fault::ALL.len());
         assert_eq!(Fault::Cpu.cause(), Cause::process("PCSLEUTH-FAULT-CPU.EXE"));
+    }
+
+    #[test]
+    fn the_cpu_and_disk_hogs_run_beside_an_idle_decoy_that_is_not_the_cause() {
+        for name in ["cpu-hog-live", "disk-hog-live"] {
+            let scenario = find(name).unwrap();
+            let Inject::Live { decoy, .. } = scenario.inject else {
+                panic!("{name} is not a live scenario");
+            };
+            let decoy = decoy.expect("a decoy");
+            assert_eq!(decoy, Fault::Idle);
+            assert_ne!(decoy.cause(), scenario.fault().cause());
+            assert!(decoy.exe().starts_with(EXE_PREFIX));
+        }
     }
 
     #[test]

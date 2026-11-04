@@ -21,6 +21,7 @@ const CPU: &str = env!("CARGO_BIN_EXE_pcsleuth-fault-cpu");
 const DISK: &str = env!("CARGO_BIN_EXE_pcsleuth-fault-disk");
 const POWER: &str = env!("CARGO_BIN_EXE_pcsleuth-fault-power-request");
 const TIMER: &str = env!("CARGO_BIN_EXE_pcsleuth-fault-wake-timer");
+const IDLE: &str = env!("CARGO_BIN_EXE_pcsleuth-fault-idle");
 
 #[test]
 fn the_safe_injectors_say_ready_and_exit_by_themselves() {
@@ -29,6 +30,7 @@ fn the_safe_injectors_say_ready_and_exit_by_themselves() {
         (CPU, Fault::Cpu),
         (DISK, Fault::Disk),
         (POWER, Fault::PowerRequest),
+        (IDLE, Fault::Idle),
     ] {
         let started = Instant::now();
         let mut injected = spawn(&job, exe, fault, &["--secs", "1"]).unwrap();

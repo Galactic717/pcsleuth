@@ -10,3 +10,4 @@ publish.workspace = true
 [dependencies]
 jiff.workspace = true
 pcsleuth-core.workspace = true
+pcsleuth-sources.workspace = true
