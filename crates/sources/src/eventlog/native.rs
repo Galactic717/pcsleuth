@@ -2,7 +2,13 @@
 //!
 //! This is the only place in the event log code that uses `unsafe`. Handles are closed by
 //! [`Owned`]. Nothing here panics on what the OS returns: every failure becomes an [`Access`].
+//!
+//! What a read returns is decided in `collect.rs`, which is pure: `Ok` only when nothing is
+//! missing, `Partial` (with the reason) when records were unreadable, the read failed part way,
+//! the limit was reached with more left, or the log's state is unknown, and `Failed` only when
+//! nothing was read.
 
+use std::collections::VecDeque;
 use std::mem::size_of;
 
 use jiff::Timestamp;
@@ -16,6 +22,7 @@ use windows::Win32::System::EventLog::{
 use windows::core::{Error, HSTRING, Owned};
 
 use super::apps::ApplicationEvent;
+use super::collect::{ChannelRead, Step, collect, finish_channel, merge};
 use super::common::FromRawError;
 use super::lifecycle::LifecycleEvent;
 use super::perf::PerfEvent;
@@ -25,7 +32,7 @@ use super::raw::{RawEvent, parse_event};
 use super::resource::ResourceExhaustion;
 use super::sched::TaskEvent;
 
-/// Events fetched per `EvtNext` call.
+/// Events fetched per `EvtNext` call, at most.
 const BATCH: usize = 32;
 /// How long one `EvtNext` may wait, in milliseconds. Local reads return at once.
 const NEXT_TIMEOUT_MS: u32 = 5_000;
@@ -75,10 +82,14 @@ fn render_xml(event: EVT_HANDLE) -> Result<String, Error> {
     ))
 }
 
-/// Whether the channel is switched on, from its configuration.
-fn channel_enabled(channel: &str) -> Result<bool, Error> {
+/// Whether the channel is switched on, from its configuration. `Err` when that cannot be told:
+/// the configuration cannot be read, or `Enabled` is not a Boolean.
+fn channel_enabled(channel: &str) -> Result<bool, Access> {
     // SAFETY: the channel path is a valid string for the call; `None` selects the local machine.
-    let config = unsafe { Owned::new(EvtOpenChannelConfig(None, &HSTRING::from(channel), 0)?) };
+    let config = unsafe { EvtOpenChannelConfig(None, &HSTRING::from(channel), 0) }
+        .map_err(|e| access_from_error(&e))?;
+    // SAFETY: the handle is new and owned by nobody else.
+    let config = unsafe { Owned::new(config) };
     let mut value = EVT_VARIANT::default();
     let mut used = 0u32;
     // SAFETY: the buffer is one EVT_VARIANT and its size is passed; a Boolean needs no more room.
@@ -90,14 +101,104 @@ fn channel_enabled(channel: &str) -> Result<bool, Error> {
             size_of::<EVT_VARIANT>() as u32,
             Some(&mut value),
             &mut used,
-        )?;
+        )
     }
-    // SAFETY: Enabled is documented as a Boolean variant; `Type` is checked before reading it.
-    Ok(value.Type != EvtVarTypeBoolean.0 as u32 || unsafe { value.Anonymous.BooleanVal }.as_bool())
+    .map_err(|e| access_from_error(&e))?;
+    // SAFETY: the union is read as a Boolean only after `Type` says it is one.
+    enabled_from_variant(value.Type, || {
+        unsafe { value.Anonymous.BooleanVal }.as_bool()
+    })
 }
 
-/// Read up to `limit` events, newest first. `source` is how the result is labelled.
-fn read(source: SourceId, channel: &str, xpath: &str, limit: usize) -> Sourced<RawEvent> {
+/// `Enabled` is documented as a Boolean. Anything else is not "enabled": it is an answer this
+/// reader does not understand, and it says so.
+fn enabled_from_variant(variant_type: u32, boolean: impl FnOnce() -> bool) -> Result<bool, Access> {
+    if variant_type == EvtVarTypeBoolean.0 as u32 {
+        return Ok(boolean());
+    }
+    Err(Access::Failed {
+        code: 0,
+        message: format!("the Enabled property has variant type {variant_type}, not Boolean"),
+    })
+}
+
+/// A query over one channel, yielding its records newest first.
+struct Cursor {
+    results: Owned<EVT_HANDLE>,
+    /// Event handles fetched and not yet rendered. Dropping one closes it.
+    pending: VecDeque<Owned<EVT_HANDLE>>,
+    /// How many handles to ask `EvtNext` for at a time, at most [`BATCH`].
+    batch: usize,
+    failure: Option<Access>,
+    done: bool,
+}
+
+impl Cursor {
+    fn fetch(&mut self) {
+        let mut handles = [0isize; BATCH];
+        let want = self.batch.min(BATCH);
+        let mut returned = 0u32;
+        // SAFETY: `handles[..want]` is writable, `returned` is a valid out pointer, and `results` is open.
+        let status = unsafe {
+            EvtNext(
+                *self.results,
+                &mut handles[..want],
+                NEXT_TIMEOUT_MS,
+                0,
+                &mut returned,
+            )
+        };
+        let returned = (returned as usize).min(want);
+        for &raw_handle in &handles[..returned] {
+            // SAFETY: EvtNext returned this handle to us; `Owned` closes it.
+            self.pending
+                .push_back(unsafe { Owned::new(EVT_HANDLE(raw_handle)) });
+        }
+        match status {
+            Ok(()) if returned > 0 => {}
+            // No handles and no error would loop forever; treat it as the end.
+            Ok(()) => self.done = true,
+            Err(e) if win32_code(e.code().0) == ERROR_NO_MORE_ITEMS.0 => self.done = true,
+            Err(e) => {
+                self.failure = Some(access_from_error(&e));
+                self.done = true;
+            }
+        }
+    }
+}
+
+impl Iterator for Cursor {
+    type Item = Step;
+
+    fn next(&mut self) -> Option<Step> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                // A record that cannot be rendered or parsed is counted by `collect`, not fatal.
+                let raw = render_xml(*event)
+                    .ok()
+                    .and_then(|xml| parse_event(&xml).ok());
+                return Some(Step::Event(raw));
+            }
+            // Handles that arrived with an error are delivered before it.
+            if let Some(access) = self.failure.take() {
+                return Some(Step::Failed(access));
+            }
+            if self.done {
+                return None;
+            }
+            self.fetch();
+        }
+    }
+}
+
+/// Read one channel, newest first, until `limit` records were accepted by `convert` or the channel
+/// ends. The result says everything about completeness except the limit, which `merge` adds.
+fn read_channel<T>(
+    channel: &str,
+    xpath: &str,
+    limit: usize,
+    convert: impl FnMut(RawEvent) -> Option<T>,
+) -> ChannelRead<T> {
     let xpath = if xpath.trim().is_empty() { "*" } else { xpath };
     let flags = EvtQueryChannelPath.0 | EvtQueryReverseDirection.0;
     // SAFETY: both strings are valid for the call; `None` selects the local machine.
@@ -105,67 +206,57 @@ fn read(source: SourceId, channel: &str, xpath: &str, limit: usize) -> Sourced<R
         match unsafe { EvtQuery(None, &HSTRING::from(channel), &HSTRING::from(xpath), flags) } {
             // SAFETY: the handle is new and owned by nobody else.
             Ok(handle) => unsafe { Owned::new(handle) },
-            Err(e) => return Sourced::unreadable(source, access_from_error(&e)),
-        };
-
-    let mut data = Vec::new();
-    let mut failure = None;
-    while data.len() < limit {
-        let mut batch = [0isize; BATCH];
-        let want = (limit - data.len()).min(BATCH);
-        let mut returned = 0u32;
-        // SAFETY: `batch[..want]` is writable, `returned` is a valid out pointer, and `results` is open.
-        let status = unsafe {
-            EvtNext(
-                *results,
-                &mut batch[..want],
-                NEXT_TIMEOUT_MS,
-                0,
-                &mut returned,
-            )
-        };
-        for &raw_handle in &batch[..(returned as usize).min(want)] {
-            // SAFETY: EvtNext returned this handle to us; `Owned` closes it.
-            let event = unsafe { Owned::new(EVT_HANDLE(raw_handle)) };
-            // A record that cannot be rendered or parsed is skipped, not fatal.
-            if let Some(parsed) = render_xml(*event)
-                .ok()
-                .and_then(|xml| parse_event(&xml).ok())
-            {
-                data.push(parsed);
-            }
-        }
-        match status {
-            Ok(()) => {}
-            Err(e) if win32_code(e.code().0) == ERROR_NO_MORE_ITEMS.0 => break,
             Err(e) => {
-                failure = Some(access_from_error(&e));
-                break;
+                return ChannelRead {
+                    access: access_from_error(&e),
+                    data: Vec::new(),
+                    more: false,
+                };
             }
-        }
-    }
-
-    let access = match failure {
-        Some(access) => access,
-        // A disabled channel can still hold old records, so they stay in `data`.
-        None if matches!(channel_enabled(channel), Ok(false)) => Access::LogDisabled,
-        None => Access::Ok,
+        };
+    let cursor = Cursor {
+        results,
+        pending: VecDeque::new(),
+        // One more than the limit, so the look past it needs no second call.
+        batch: limit.saturating_add(1).clamp(1, BATCH),
+        failure: None,
+        done: false,
     };
-    Sourced {
-        source,
-        access,
-        data,
-    }
+    finish_channel(channel, collect(cursor, limit, convert), || {
+        channel_enabled(channel)
+    })
+}
+
+/// Read each of `channels` and merge them, newest first, at most `limit` records in all.
+fn read_channels<T>(
+    source: SourceId,
+    channels: &[&str],
+    xpath: &str,
+    limit: usize,
+    mut convert: impl FnMut(RawEvent) -> Option<(Option<Timestamp>, T)>,
+) -> Sourced<T> {
+    let parts = channels
+        .iter()
+        .map(|channel| read_channel(channel, xpath, limit, &mut convert))
+        .collect();
+    merge(source, parts, limit)
 }
 
 /// Read raw events from one of the channels this crate knows (see [`source_for_channel`]),
 /// newest first, at most `limit`. `xpath` may be empty for "everything".
 ///
+/// The result is `Ok` only when nothing is missing. Records that could not be rendered or parsed,
+/// a read that failed part way, and `limit` being reached while more records exist are each an
+/// [`Access::Partial`] that says so, with the records that were read kept in `data`. Looking for
+/// more past the limit never changes `data`.
+///
 /// A channel this crate does not know is reported as [`Access::Missing`] under the System source,
 /// because the contract has no source to file it under.
 pub fn query(channel: &str, xpath: &str, limit: usize) -> Sourced<RawEvent> {
     match source_for_channel(channel) {
-        Some(source) => read(source, channel, xpath, limit),
+        Some(source) => read_channels(source, &[channel], xpath, limit, |raw| {
+            Some((raw.time_created, raw))
+        }),
         None => Sourced::unreadable(SourceId::EventLogSystem, Access::Missing),
     }
 }
@@ -173,46 +264,29 @@ pub fn query(channel: &str, xpath: &str, limit: usize) -> Sourced<RawEvent> {
 /// Whether a channel can be read: `Missing` when it is not registered, `LogDisabled` when it is
 /// switched off, `NeedsAdmin` when Windows denies the read, `Ok` otherwise. For `doctor`.
 pub fn channel_status(channel: &str) -> Access {
-    match channel_enabled(channel) {
-        Err(e) => return access_from_error(&e),
-        Ok(false) => return Access::LogDisabled,
-        Ok(true) => {}
-    }
-    let source = source_for_channel(channel).unwrap_or(SourceId::EventLogSystem);
-    read(source, channel, "*", 1).access
+    // One record shows the channel can be read; whether more exist does not matter here.
+    read_channel(channel, "*", 1, Some).access
 }
 
-/// Every channel of a family, merged. The first channel that could not be read decides `access`.
-fn fetch(family: Family, since: Option<Timestamp>, limit: usize) -> Sourced<RawEvent> {
-    let xpath = family.xpath(since);
-    let mut out = Sourced::ok(family.source(), Vec::new());
-    for channel in family.channels() {
-        let part = read(family.source(), channel, &xpath, limit);
-        if out.access.is_ok() {
-            out.access = part.access;
-        }
-        out.data.extend(part.data);
-    }
-    if family.channels().len() > 1 {
-        out.data.sort_by_key(|e| std::cmp::Reverse(e.time_created));
-        out.data.truncate(limit);
-    }
-    out
-}
-
-/// Records that cannot become the typed event are skipped; the rest keep their order.
+/// Every channel of a family, merged, as the typed event. The limit is on typed events: a record
+/// that fails `convert` is counted as unreadable and does not use up the limit, so it cannot push a
+/// real record out. Unreadable records make the result `Partial`.
 fn typed<T>(
     family: Family,
     since: Option<Timestamp>,
     limit: usize,
     convert: fn(&RawEvent) -> Result<T, FromRawError>,
 ) -> Sourced<T> {
-    let raw = fetch(family, since, limit);
-    Sourced {
-        source: raw.source,
-        access: raw.access,
-        data: raw.data.iter().filter_map(|r| convert(r).ok()).collect(),
-    }
+    read_channels(
+        family.source(),
+        family.channels(),
+        &family.xpath(since),
+        limit,
+        |raw| {
+            let time = raw.time_created;
+            convert(&raw).ok().map(|item| (time, item))
+        },
+    )
 }
 
 /// Power-Troubleshooter 1 wake records, newest first.
@@ -251,6 +325,9 @@ pub fn lifecycle_events(since: Option<Timestamp>, limit: usize) -> Sourced<Lifec
 }
 
 /// Application Error 1000, Application Hang 1002 and Windows Error Reporting 1001, newest first.
+///
+/// Providers in the Application log can be forged by any local process, so a record shows what was
+/// logged, not that the program crashed.
 pub fn application_events(since: Option<Timestamp>, limit: usize) -> Sourced<ApplicationEvent> {
     typed(
         Family::Applications,
@@ -287,19 +364,34 @@ mod tests {
     use jiff::SignedDuration;
 
     use super::*;
+    use crate::eventlog::collect::limit_message;
     use crate::eventlog::query::{DIAGNOSTICS_PERFORMANCE, SYSTEM, TASK_SCHEDULER};
 
     fn readable_or_gated(access: &Access) -> bool {
         matches!(
             access,
-            Access::Ok | Access::NeedsAdmin | Access::LogDisabled
+            Access::Ok | Access::NeedsAdmin | Access::LogDisabled | Access::Partial { .. }
         )
+    }
+
+    /// The read is complete, or incomplete only because it stopped at `limit` with more left.
+    #[track_caller]
+    fn complete_or_limited<T>(read: &Sourced<T>, limit: usize) {
+        if read.access != Access::Ok {
+            assert_eq!(
+                read.access,
+                Access::Partial {
+                    message: limit_message(limit)
+                }
+            );
+            assert_eq!(read.data.len(), limit);
+        }
     }
 
     #[test]
     fn system_log_reads_newest_first() {
         let read = query(SYSTEM, "*", 40);
-        assert_eq!(read.access, Access::Ok);
+        complete_or_limited(&read, 40);
         assert_eq!(read.source, SourceId::EventLogSystem);
         assert!(!read.data.is_empty() && read.data.len() <= 40);
         assert!(
@@ -325,18 +417,40 @@ mod tests {
     }
 
     #[test]
-    fn limit_is_respected_and_zero_reads_nothing() {
-        assert_eq!(query(SYSTEM, "", 3).data.len(), 3);
+    fn hitting_the_limit_is_partial_and_zero_reads_nothing() {
+        // The System log of a machine that has run holds far more than three records.
+        let three = query(SYSTEM, "", 3);
+        assert_eq!(three.data.len(), 3);
+        assert_eq!(
+            three.access,
+            Access::Partial {
+                message: limit_message(3)
+            }
+        );
         let none = query(SYSTEM, "*", 0);
-        assert_eq!((none.access, none.data.len()), (Access::Ok, 0));
+        assert!(none.data.is_empty());
+        assert_eq!(
+            none.access,
+            Access::Partial {
+                message: limit_message(0)
+            }
+        );
+    }
+
+    #[test]
+    fn a_limit_above_what_exists_is_a_complete_read() {
+        let hour_ago = Timestamp::now() - SignedDuration::from_hours(1);
+        let recent = query(SYSTEM, &Family::Lifecycle.xpath(Some(hour_ago)), 1_000);
+        assert_eq!(recent.access, Access::Ok);
+        assert!(recent.data.len() < 1_000);
     }
 
     #[test]
     fn finds_and_types_power_or_event_log_records() {
         let wakes = wakes(None, 20);
         let life = lifecycle_events(None, 20);
-        assert_eq!(wakes.access, Access::Ok);
-        assert_eq!(life.access, Access::Ok);
+        complete_or_limited(&wakes, 20);
+        complete_or_limited(&life, 20);
         assert!(
             !wakes.data.is_empty() || !life.data.is_empty(),
             "a machine that has booted has logged a wake or an Event Log start"
@@ -350,10 +464,27 @@ mod tests {
     }
 
     #[test]
+    fn records_that_do_not_convert_are_reported_and_do_not_use_up_the_limit() {
+        let raw = query(SYSTEM, &Family::Lifecycle.xpath(None), 1);
+        assert!(!raw.data.is_empty(), "every booted machine logs 6005");
+        let rejected = typed::<()>(Family::Lifecycle, None, 3, |_| {
+            Err(FromRawError::MissingField("x"))
+        });
+        assert!(rejected.data.is_empty());
+        match &rejected.access {
+            Access::Partial { message } => {
+                assert!(message.contains("could not be read"), "{message}");
+                assert!(!message.contains("limit reached"), "{message}");
+            }
+            other => panic!("expected Partial, got {other}"),
+        }
+    }
+
+    #[test]
     fn every_system_family_reads_without_failing() {
-        assert_eq!(kernel_power(None, 10).access, Access::Ok);
-        assert_eq!(processor_caps(None, 10).access, Access::Ok);
-        assert_eq!(application_events(None, 10).access, Access::Ok);
+        complete_or_limited(&kernel_power(None, 10), 10);
+        complete_or_limited(&processor_caps(None, 10), 10);
+        complete_or_limited(&application_events(None, 10), 10);
         assert!(readable_or_gated(&resource_exhaustion(None, 10).access));
     }
 
@@ -377,13 +508,7 @@ mod tests {
             Access::Missing
         );
         assert_eq!(
-            read(
-                SourceId::EventLogSystem,
-                "Pcsleuth-Does-Not-Exist/Operational",
-                "*",
-                1
-            )
-            .access,
+            read_channel("Pcsleuth-Does-Not-Exist/Operational", "*", 1, Some).access,
             Access::Missing
         );
         assert_eq!(query("Not-A-Known-Channel", "*", 1).access, Access::Missing);
@@ -393,7 +518,7 @@ mod tests {
     fn denied_channel_maps_to_needs_admin_not_a_failure() {
         // The Security log needs an elevated token. This asserts the mapping on whichever side the
         // test runs: unelevated gives NeedsAdmin, elevated gives Ok.
-        let read = read(SourceId::EventLogSystem, "Security", "*", 1);
+        let read = read_channel("Security", "*", 1, Some);
         assert!(
             matches!(read.access, Access::NeedsAdmin | Access::Ok),
             "{:?}",
@@ -407,14 +532,26 @@ mod tests {
     }
 
     #[test]
+    fn a_channel_setting_that_is_not_a_boolean_is_not_assumed_enabled() {
+        let boolean = EvtVarTypeBoolean.0 as u32;
+        assert_eq!(enabled_from_variant(boolean, || true), Ok(true));
+        assert_eq!(enabled_from_variant(boolean, || false), Ok(false));
+        let other = enabled_from_variant(boolean + 1, || unreachable!("not read"));
+        assert!(matches!(other, Err(Access::Failed { .. })), "{other:?}");
+        // The real channels answer with a Boolean.
+        assert_eq!(channel_enabled(SYSTEM), Ok(true));
+    }
+
+    #[test]
     fn since_is_understood_by_the_event_log() {
         let since = Timestamp::now() - SignedDuration::from_hours(24 * 30);
         let recent = query(SYSTEM, &Family::Lifecycle.xpath(Some(since)), 50);
-        assert_eq!(
-            recent.access,
-            Access::Ok,
-            "the since predicate was rejected"
+        assert!(
+            matches!(recent.access, Access::Ok | Access::Partial { .. }),
+            "the since predicate was rejected: {:?}",
+            recent.access
         );
+        complete_or_limited(&recent, 50);
         assert!(recent.data.iter().all(|e| e.time_created >= Some(since)));
         let future = Timestamp::now() + SignedDuration::from_hours(24);
         let none = wakes(Some(future), 5);

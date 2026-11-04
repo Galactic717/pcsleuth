@@ -1,11 +1,15 @@
 //! Walks the SRUM tables of one clean database file and feeds the pure accumulator.
+//!
+//! Nothing is dropped without being counted. A row whose time or ids cannot be read, a counter
+//! that is null or not a number, and a value too large to read are tallied per table and reported
+//! as notes, so the caller can say the numbers are incomplete.
 
 use std::path::Path;
 
 use jiff::Timestamp;
 use pcsleuth_core::Access;
 
-use super::decode::{Value, decode_id_blob};
+use super::decode::{Counter, Value, decode_id_blob};
 use super::energy::decode_energy;
 use super::ese::{Column, Database, EseError, Instance, Params, Table, database_page_size};
 use super::usage::{Accumulator, AppUsage, IdMap, Usage};
@@ -101,6 +105,31 @@ fn read_tables(
     )))
 }
 
+/// What one table gave up on: rows left out, and counter values that read as zero.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Tally {
+    rows: u64,
+    values: u64,
+}
+
+impl Tally {
+    /// Add a note for each kind of loss, if there was any.
+    fn report(&self, table: SrumTable, notes: &mut Vec<SchemaNote>) {
+        if self.rows > 0 {
+            notes.push(SchemaNote::RowsSkipped {
+                table,
+                count: self.rows,
+            });
+        }
+        if self.values > 0 {
+            notes.push(SchemaNote::ValuesUnreadable {
+                table,
+                count: self.values,
+            });
+        }
+    }
+}
+
 /// Open `which`, or note that it is absent.
 fn open_table<'d, 's, 'i>(
     database: &'d Database<'s, 'i>,
@@ -146,8 +175,23 @@ fn cell(table: &Table<'_, '_, '_>, column: &Option<Column>) -> Result<Option<Val
     }
 }
 
-fn count(table: &Table<'_, '_, '_>, column: &Option<Column>) -> Result<u64, EseError> {
-    Ok(cell(table, column)?.and_then(|v| v.as_u64()).unwrap_or(0))
+/// A counter. A column the table lacks reads zero (that is already a `ColumnAbsent` note). A value
+/// that is null, negative or not a number also reads zero, but is tallied.
+fn count(
+    table: &Table<'_, '_, '_>,
+    column: &Option<Column>,
+    tally: &mut Tally,
+) -> Result<u64, EseError> {
+    let Some(column) = column else {
+        return Ok(0);
+    };
+    Ok(match table.value(column)?.counter() {
+        Counter::Count(n) => n,
+        Counter::Null | Counter::Invalid => {
+            tally.values += 1;
+            0
+        }
+    })
 }
 
 fn read_id_map(
@@ -163,15 +207,19 @@ fn read_id_map(
     let Some(columns) = resolve_columns(&table, which, &spec, notes)? else {
         return Ok(());
     };
+    let mut tally = Tally::default();
     let mut more = table.first()?;
     while more {
         let id = cell(&table, &columns[0])?.and_then(|v| v.as_i64());
-        let blob = cell(&table, &columns[1])?;
-        if let (Some(id), Some(Value::Bytes(blob))) = (id, blob) {
-            names.insert(id, decode_id_blob(&blob));
+        match (id, cell(&table, &columns[1])?) {
+            (Some(id), Some(Value::Bytes(blob))) => names.insert(id, decode_id_blob(&blob)),
+            // An entry with no name is how SRUM leaves an id unnamed.
+            (Some(_), Some(Value::Null)) => {}
+            _ => tally.rows += 1,
         }
         more = table.next()?;
     }
+    tally.report(which, notes);
     Ok(())
 }
 
@@ -199,20 +247,28 @@ fn read_resource_usage(
     let Some(c) = resolve_columns(&table, which, &spec, notes)? else {
         return Ok(false);
     };
+    let mut tally = Tally::default();
     let mut more = table.first()?;
     while more {
-        if let Some((at, app, user)) = key(&table, &c[0], &c[1], &c[2], accumulator)? {
-            let delta = Usage {
-                cpu_cycles_foreground: count(&table, &c[3])?,
-                cpu_cycles_background: count(&table, &c[4])?,
-                bytes_read: count(&table, &c[5])?.saturating_add(count(&table, &c[7])?),
-                bytes_written: count(&table, &c[6])?.saturating_add(count(&table, &c[8])?),
-                ..Usage::default()
-            };
-            accumulator.add(at, app, user, &delta);
+        match key(&table, &c[0], &c[1], &c[2], accumulator)? {
+            Key::Row(at, app, user) => {
+                let delta = Usage {
+                    cpu_cycles_foreground: count(&table, &c[3], &mut tally)?,
+                    cpu_cycles_background: count(&table, &c[4], &mut tally)?,
+                    bytes_read: count(&table, &c[5], &mut tally)?
+                        .saturating_add(count(&table, &c[7], &mut tally)?),
+                    bytes_written: count(&table, &c[6], &mut tally)?
+                        .saturating_add(count(&table, &c[8], &mut tally)?),
+                    ..Usage::default()
+                };
+                accumulator.add(at, app, user, &delta);
+            }
+            Key::Outside => {}
+            Key::Unreadable => tally.rows += 1,
         }
         more = table.next()?;
     }
+    tally.report(which, notes);
     Ok(true)
 }
 
@@ -235,18 +291,24 @@ fn read_network_usage(
     let Some(c) = resolve_columns(&table, which, &spec, notes)? else {
         return Ok(false);
     };
+    let mut tally = Tally::default();
     let mut more = table.first()?;
     while more {
-        if let Some((at, app, user)) = key(&table, &c[0], &c[1], &c[2], accumulator)? {
-            let delta = Usage {
-                net_sent: count(&table, &c[3])?,
-                net_received: count(&table, &c[4])?,
-                ..Usage::default()
-            };
-            accumulator.add(at, app, user, &delta);
+        match key(&table, &c[0], &c[1], &c[2], accumulator)? {
+            Key::Row(at, app, user) => {
+                let delta = Usage {
+                    net_sent: count(&table, &c[3], &mut tally)?,
+                    net_received: count(&table, &c[4], &mut tally)?,
+                    ..Usage::default()
+                };
+                accumulator.add(at, app, user, &delta);
+            }
+            Key::Outside => {}
+            Key::Unreadable => tally.rows += 1,
         }
         more = table.next()?;
     }
+    tally.report(which, notes);
     Ok(true)
 }
 
@@ -268,11 +330,12 @@ fn read_energy(
     let Some(c) = resolve_columns(&table, which, &spec, notes)? else {
         return Ok(false);
     };
+    let mut tally = Tally::default();
     let mut skipped = 0u64;
     let mut more = table.first()?;
     while more {
-        if let Some((at, app, user)) = key(&table, &c[0], &c[1], &c[2], accumulator)? {
-            match cell(&table, &c[3])? {
+        match key(&table, &c[0], &c[1], &c[2], accumulator)? {
+            Key::Row(at, app, user) => match cell(&table, &c[3])? {
                 Some(Value::Bytes(blob)) => match decode_energy(&blob) {
                     Ok(record) => {
                         let total = record.total();
@@ -286,32 +349,48 @@ fn read_energy(
                     Err(_) => skipped += 1,
                 },
                 _ => skipped += 1,
-            }
+            },
+            Key::Outside => {}
+            Key::Unreadable => tally.rows += 1,
         }
         more = table.next()?;
     }
     if skipped > 0 {
         notes.push(SchemaNote::EnergyRecordsSkipped { count: skipped });
     }
+    tally.report(which, notes);
     Ok(true)
 }
 
-/// The time and ids of the current row, or `None` when the row is outside the window or has no
-/// readable time or ids. Checking the time first skips the other columns of rows we would drop.
+/// What the time and ids of the current row say about it.
+enum Key {
+    /// A reading in the window.
+    Row(Timestamp, i64, i64),
+    /// A reading with a readable time outside the window. Not an error.
+    Outside,
+    /// No readable time, app id or user id: the row cannot be placed, so it is counted.
+    Unreadable,
+}
+
+/// The time and ids of the current row. Checking the time first skips the other columns of rows
+/// outside the window.
 fn key(
     table: &Table<'_, '_, '_>,
     time: &Option<Column>,
     app: &Option<Column>,
     user: &Option<Column>,
     accumulator: &Accumulator,
-) -> Result<Option<(Timestamp, i64, i64)>, EseError> {
+) -> Result<Key, EseError> {
     let Some(at) = cell(table, time)?.and_then(|v| v.as_timestamp()) else {
-        return Ok(None);
+        return Ok(Key::Unreadable);
     };
     if !accumulator.contains(at) {
-        return Ok(None);
+        return Ok(Key::Outside);
     }
     let app = cell(table, app)?.and_then(|v| v.as_i64());
     let user = cell(table, user)?.and_then(|v| v.as_i64());
-    Ok(app.zip(user).map(|(app, user)| (at, app, user)))
+    Ok(match app.zip(user) {
+        Some((app, user)) => Key::Row(at, app, user),
+        None => Key::Unreadable,
+    })
 }

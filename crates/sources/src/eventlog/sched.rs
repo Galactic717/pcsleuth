@@ -113,13 +113,13 @@ impl TaskEvent {
         })
     }
 
+    /// `user_context` is not in the evidence: it names the account the task ran as.
     pub fn to_evidence(&self) -> Evidence {
         self.meta
             .evidence(SourceId::ScheduledTasks, self.kind.id())
             .with_field("task_event", self.kind.label())
             .with_field("task_name", self.task_name.as_str())
             .opt("instance_id", self.instance_id.as_deref())
-            .opt("user_context", self.user_context.as_deref())
             .opt("action_name", self.action_name.as_deref())
             .opt(
                 "result_code",
@@ -174,6 +174,11 @@ mod tests {
         assert_eq!(
             events[2].user_context.as_deref(),
             Some(r"NT AUTHORITY\SYSTEM")
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| !e.to_evidence().fields.contains_key("user_context"))
         );
     }
 

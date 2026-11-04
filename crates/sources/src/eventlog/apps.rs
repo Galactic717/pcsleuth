@@ -3,7 +3,7 @@
 
 use pcsleuth_core::{Evidence, SourceId};
 
-use super::common::{EvidenceExt, FromRawError, Meta};
+use super::common::{EvidenceExt, FromRawError, Meta, collapse_profile_path};
 use super::raw::RawEvent;
 
 const APPLICATION_ERROR: &[&str] = &["Application Error"];
@@ -70,8 +70,8 @@ impl AppCrash {
                 self.fault_offset.map(|o| format!("0x{o:x}")),
             )
             .opt("process_id", self.process_id)
-            .opt("app_path", self.app_path.as_deref())
-            .opt("module_path", self.module_path.as_deref())
+            .path("app_path", self.app_path.as_deref())
+            .path("module_path", self.module_path.as_deref())
             .opt("report_id", self.report_id.as_deref())
             .opt("package_full_name", self.package_full_name.as_deref())
     }
@@ -115,7 +115,7 @@ impl AppHang {
             .with_field("app_name", self.app_name.as_str())
             .opt("app_version", self.app_version.as_deref())
             .opt("process_id", self.process_id)
-            .opt("exe_path", self.exe_path.as_deref())
+            .path("exe_path", self.exe_path.as_deref())
             .opt("report_id", self.report_id.as_deref())
             .opt("package_full_name", self.package_full_name.as_deref())
             .opt("hang_type", self.hang_type.as_deref())
@@ -176,7 +176,7 @@ impl WerReport {
             .opt("response_localized", self.response.as_deref());
         for (i, p) in self.parameters.iter().enumerate() {
             if !p.is_empty() {
-                e = e.with_field(format!("p{}", i + 1), p.as_str());
+                e = e.with_field(format!("p{}", i + 1), collapse_profile_path(p));
             }
         }
         e

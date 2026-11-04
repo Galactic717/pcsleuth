@@ -49,7 +49,9 @@ required, and `SRU.log` holding it. The logs record the live path `C:\WINDOWS\sy
   replay and reads do not write ESENT events to the Application log.
 - **The cursor calls need the `Win32_Storage_StructuredStorage` feature** of the `windows` crate, not only
   `Win32_Storage_Jet`, because `JET_TABLEID` lives there. It is added to `crates/sources/Cargo.toml`.
-- Replay plus a full read took 6.7 s here, 176,873 hour buckets.
+- Replay plus a full read took 6.7 s here, 176,873 hour buckets. After the hardening below, which merges accounts of
+  the same kind and collapses profile folders in app names, the same copy gives 171,558 buckets and the same energy
+  totals.
 
 ### Schema found
 
@@ -89,6 +91,32 @@ shadow copy and has 6,130 more rows from its last day, so the comparison covers 
 
 The values are SRUM's own units, the same numbers `powercfg` prints. They are not documented. Summed over all apps an
 active hour comes to about 1e8, which fits millijoules (about 25 W), but that is inferred.
+
+### Hardening
+
+- **The scratch folder is private.** The elevated copy of `SRUDB.dat` and ESE's temporary files go to a folder in the
+  temp directory. A folder made the usual way inherits the user's access list, so another process of the same user could
+  read the copy, swap a file before the elevated replay, or plant a link where an elevated tool writes. The folder is
+  made by `CreateDirectoryW` (it fails if the name exists) under `pcsleuth-<tag>-<128 random bits as 32 hex digits>`, with
+  a protected access list for SYSTEM and Administrators only, inherited by what is created inside
+  (`D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`), and this process holds a handle that does not share delete, so the folder
+  cannot be renamed away and replaced while it is in use. A process that is not elevated (the tests, `read_usage` on a
+  copy the caller already owns) adds the current user, so it can use its own folder; elevated, the user is left out on
+  purpose. Not covered: another process of the same user can still delete files it can reach in the temp folder, and
+  the window between creating the folder and opening the handle is not zero. The tests check the list, that the name
+  is never reused, that the folder cannot be renamed while held, and that dropping or `remove` deletes it.
+- **A read says when it is incomplete.** `Access::Ok` means nothing is missing. An absent table or column, rows whose
+  time or ids cannot be read, counter values that are null, negative or not numbers, undecodable energy rows, and a read
+  that stopped after getting some data are each `Access::Partial` with the reason, and the data is kept. `Failed` is for
+  a read that got nothing. The same facts are typed in `SchemaNote`. Replaying logs is a note only, and so is a scratch
+  folder that could not be deleted afterwards (`ScratchNotRemoved`; `TempCopy::close` reports the same for a copy).
+  The elevated snapshot also fails, instead of copying fewer logs, when a directory entry of `System32\SRU` cannot be
+  read.
+- **Column values are capped.** A value larger than 4096 bytes is counted as a skipped row and never allocated, because
+  its size comes from the file. Real values are under 1 KB.
+- **No SIDs and no user names in the output.** Accounts are `user` or `system` (`AccountKind`), and accounts of the same
+  kind share a bucket. App names keep the program and its place, with a profile folder written as `%USERPROFILE%`.
+- **A mid-hour `since`** keeps the bucket of that hour when buckets are summed.
 
 ### Not verified
 

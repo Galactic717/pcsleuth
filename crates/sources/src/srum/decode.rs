@@ -33,9 +33,30 @@ pub(crate) enum Value {
     /// An OLE Automation date: days since 1899-12-30, UTC.
     Date(f64),
     Bytes(Vec<u8>),
+    /// The column held more bytes than the reader will allocate for one value, so only its size
+    /// was kept. A SRUM database has no value this large; one that does is damaged or hostile.
+    Oversized(u32),
+}
+
+/// What a counter column's value means as a count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Counter {
+    Count(u64),
+    /// Nothing was stored.
+    Null,
+    /// Negative, fractional, too large, or not a number at all.
+    Invalid,
 }
 
 impl Value {
+    /// Read this value as a counter.
+    pub(crate) fn counter(&self) -> Counter {
+        match self {
+            Value::Null => Counter::Null,
+            other => other.as_u64().map_or(Counter::Invalid, Counter::Count),
+        }
+    }
+
     /// Interpret the raw bytes ESE returned for a column of type `coltyp`. A length that does not
     /// fit the type falls back to [`Value::Bytes`] instead of guessing.
     pub(crate) fn from_raw(coltyp: u32, raw: &[u8]) -> Value {
@@ -281,6 +302,24 @@ mod tests {
         assert_eq!(Value::Float(3.5).as_u64(), None);
         assert_eq!(Value::Bytes(vec![1]).as_u64(), None);
         assert_eq!(Value::Null.as_u64(), None);
+    }
+
+    #[test]
+    fn a_counter_is_a_count_nothing_or_invalid_never_a_silent_zero() {
+        assert_eq!(Value::Uint(7).counter(), Counter::Count(7));
+        assert_eq!(Value::Int(0).counter(), Counter::Count(0));
+        assert_eq!(Value::Float(2.0).counter(), Counter::Count(2));
+        assert_eq!(Value::Null.counter(), Counter::Null);
+        for value in [
+            Value::Int(-1),
+            Value::Float(0.5),
+            Value::Float(f64::NAN),
+            Value::Date(46_329.5),
+            Value::Bytes(vec![1, 2, 3]),
+            Value::Oversized(5_000),
+        ] {
+            assert_eq!(value.counter(), Counter::Invalid, "{value:?}");
+        }
     }
 
     #[test]

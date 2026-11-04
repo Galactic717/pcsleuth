@@ -50,6 +50,7 @@ impl EseError {
             jet::JET_errDatabaseInUse => "JET_errDatabaseInUse",
             jet::JET_errInvalidParameter => "JET_errInvalidParameter",
             jet::JET_errRecoveredWithoutUndo => "JET_errRecoveredWithoutUndo",
+            jet::JET_errBufferTooSmall => "JET_errBufferTooSmall",
             JET_ERR_OBJECT_NOT_FOUND => "JET_errObjectNotFound",
             JET_ERR_COLUMN_NOT_FOUND => "JET_errColumnNotFound",
             _ => "unnamed JET_err",
@@ -471,12 +472,13 @@ impl Table<'_, '_, '_> {
         move_cursor(self.session_id(), self.id, MOVE_NEXT)
     }
 
-    /// The current row's value for `column`, widened by its type.
+    /// The current row's value for `column`, widened by its type. A value over
+    /// [`MAX_COLUMN_BYTES`] comes back as [`Value::Oversized`] without being read.
     pub(super) fn value(&self, column: &Column) -> Result<Value, EseError> {
-        let raw = retrieve(self.session_id(), self.id, column.id)?;
-        Ok(match raw {
-            None => Value::Null,
-            Some(bytes) => Value::from_raw(column.coltyp, &bytes),
+        Ok(match retrieve(self.session_id(), self.id, column.id)? {
+            Retrieved::Null => Value::Null,
+            Retrieved::Bytes(bytes) => Value::from_raw(column.coltyp, &bytes),
+            Retrieved::TooLarge(len) => Value::Oversized(len),
         })
     }
 }
@@ -503,8 +505,17 @@ impl ListCursor<'_, '_> {
         move_cursor(self.session.id, self.id, MOVE_NEXT)
     }
 
+    /// A name from ESE's own lists. One longer than [`MAX_COLUMN_BYTES`] is not a name: it is an
+    /// error, so the list is not read past it as if nothing had happened.
     fn raw(&self, column: u32) -> Result<Option<Vec<u8>>, EseError> {
-        retrieve(self.session.id, self.id, column)
+        match retrieve(self.session.id, self.id, column)? {
+            Retrieved::Null => Ok(None),
+            Retrieved::Bytes(bytes) => Ok(Some(bytes)),
+            Retrieved::TooLarge(_) => Err(EseError {
+                code: jet::JET_errBufferTooSmall,
+                call: "JetRetrieveColumn",
+            }),
+        }
     }
 }
 
@@ -517,12 +528,25 @@ fn move_cursor(session: jet::JET_SESID, table: JET_TABLEID, by: i32) -> Result<b
     check(code, "JetMove").map(|_| true)
 }
 
-/// The raw bytes of one column of the current row, or `None` for a null column.
+/// The most bytes of one column value this reader allocates. The size of a value comes from the
+/// file, so a damaged or hostile one could ask for 2 GB. Real SRUM values are far smaller: the
+/// largest, an application path in UTF-16 or an energy blob, is under 1 KB.
+const MAX_COLUMN_BYTES: usize = 4096;
+
+/// One column of the current row, as far as it was read.
+enum Retrieved {
+    Null,
+    Bytes(Vec<u8>),
+    /// The value is this many bytes, more than [`MAX_COLUMN_BYTES`]. Nothing was allocated for it.
+    TooLarge(u32),
+}
+
+/// The raw bytes of one column of the current row.
 fn retrieve(
     session: jet::JET_SESID,
     table: JET_TABLEID,
     column: u32,
-) -> Result<Option<Vec<u8>>, EseError> {
+) -> Result<Retrieved, EseError> {
     let mut stack = [0u8; 64];
     let mut actual = 0u32;
     // SAFETY: the buffer and its length match; `actual` outlives the call.
@@ -540,10 +564,13 @@ fn retrieve(
     };
     let code = check(code, "JetRetrieveColumn")?;
     if code == jet::JET_wrnColumnNull as i32 {
-        return Ok(None);
+        return Ok(Retrieved::Null);
     }
     let actual = actual as usize;
     if code == jet::JET_wrnBufferTruncated as i32 && actual > stack.len() {
+        if actual > MAX_COLUMN_BYTES {
+            return Ok(Retrieved::TooLarge(actual as u32));
+        }
         let mut heap = vec![0u8; actual];
         let mut again = 0u32;
         // SAFETY: the buffer and its length match; `again` outlives the call.
@@ -563,9 +590,9 @@ fn retrieve(
             "JetRetrieveColumn",
         )?;
         heap.truncate(again as usize);
-        return Ok(Some(heap));
+        return Ok(Retrieved::Bytes(heap));
     }
-    Ok(Some(stack[..actual.min(stack.len())].to_vec()))
+    Ok(Retrieved::Bytes(stack[..actual.min(stack.len())].to_vec()))
 }
 
 /// ESE's own name columns hold UTF-16 for the `W` calls; fall back to single bytes if they do not.

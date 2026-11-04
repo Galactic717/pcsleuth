@@ -39,12 +39,14 @@ mod copy;
 mod ese;
 #[cfg(windows)]
 mod reader;
+#[cfg(windows)]
+mod scratch;
 #[cfg(all(windows, test))]
 mod testdb;
 
 pub use decode::{IdName, decode_id_blob};
 pub use energy::{EnergyBlobError, EnergyRecord, decode_energy};
-pub use usage::{AppTotal, AppUsage, Usage, aggregate, hour_start};
+pub use usage::{AccountKind, AppTotal, AppUsage, Usage, aggregate, hour_start};
 
 #[cfg(windows)]
 pub use copy::{TempCopy, snapshot_copy};
@@ -68,20 +70,99 @@ impl SrumTable {
             SrumTable::EnergyEstimation => "{DA73FB89-2BEA-4DDC-86B8-6E048C6DA477}",
         }
     }
+
+    /// What the table holds, in words.
+    pub const fn label(self) -> &'static str {
+        match self {
+            SrumTable::IdMap => "id map",
+            SrumTable::ResourceUsage => "resource usage",
+            SrumTable::NetworkUsage => "network usage",
+            SrumTable::EnergyEstimation => "energy estimation",
+        }
+    }
 }
 
-/// Something about this database that is not an error but changes what the numbers mean.
+/// Something about this database or this read that qualifies the numbers. All but
+/// [`SchemaNote::LogsReplayed`] and [`SchemaNote::ScratchNotRemoved`] mean some counters are
+/// missing or wrong, and make the read [`Access::Partial`](pcsleuth_core::Access).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaNote {
-    /// The table is not in this database (older or newer Windows), so its counters read zero.
+    /// The table is not in this database (older or newer Windows), so its counters read zero. For
+    /// the id map it means apps and accounts have no names.
     TableAbsent(SrumTable),
     /// The column is not in the table. Optional columns read zero; a missing required column
     /// makes the whole table unreadable.
     ColumnAbsent { table: SrumTable, column: String },
     /// Energy rows whose blob this reader could not decode were left out of the sums.
     EnergyRecordsSkipped { count: u64 },
+    /// Rows of this table were left out because their time, app id or user id (for the id map,
+    /// its index or name) could not be read. Rows outside the time window are not counted here.
+    RowsSkipped { table: SrumTable, count: u64 },
+    /// Counter values in this table were null, negative or not numbers, and read as zero.
+    ValuesUnreadable { table: SrumTable, count: u64 },
     /// The copy was a dirty shutdown and its transaction logs were replayed before reading.
     LogsReplayed,
+    /// The read's temporary folder in the temp directory could not be deleted. `code` is the OS
+    /// error. It holds ESE's temporary database, which is derived from the usage data.
+    ScratchNotRemoved { code: u32 },
+}
+
+impl SchemaNote {
+    /// True when some counters are missing or wrong, false for notes that only describe how the
+    /// copy was prepared or cleaned up.
+    pub fn is_incomplete(&self) -> bool {
+        !matches!(
+            self,
+            SchemaNote::LogsReplayed | SchemaNote::ScratchNotRemoved { .. }
+        )
+    }
+}
+
+impl std::fmt::Display for SchemaNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaNote::TableAbsent(SrumTable::IdMap) => {
+                f.write_str("the id map table is absent, so apps and accounts have no names")
+            }
+            SchemaNote::TableAbsent(table) => write!(
+                f,
+                "the {} table is absent, so its counters read zero",
+                table.label()
+            ),
+            SchemaNote::ColumnAbsent { table, column } => {
+                write!(f, "the {} table has no {column} column", table.label())
+            }
+            SchemaNote::EnergyRecordsSkipped { count: 1 } => {
+                f.write_str("1 energy record could not be decoded and is not in the sums")
+            }
+            SchemaNote::EnergyRecordsSkipped { count } => write!(
+                f,
+                "{count} energy records could not be decoded and are not in the sums"
+            ),
+            SchemaNote::RowsSkipped { table, count } => write!(
+                f,
+                "{count} {} of the {} table had no readable time or ids and {} not counted",
+                if *count == 1 { "row" } else { "rows" },
+                table.label(),
+                if *count == 1 { "is" } else { "are" },
+            ),
+            SchemaNote::ValuesUnreadable { table, count } => write!(
+                f,
+                "{count} {} in the {} table {} null or not {} and read as zero",
+                if *count == 1 { "counter" } else { "counters" },
+                table.label(),
+                if *count == 1 { "was" } else { "were" },
+                if *count == 1 { "a number" } else { "numbers" },
+            ),
+            SchemaNote::LogsReplayed => {
+                f.write_str("the transaction logs were replayed on the copy before reading")
+            }
+            SchemaNote::ScratchNotRemoved { code } => write!(
+                f,
+                "temporary files in the temp folder (pcsleuth-srum-read-*) could not be deleted (os error {code})"
+            ),
+        }
+    }
 }
 
 /// Per app, per hour counters with the notes that qualify them.
@@ -91,8 +172,43 @@ pub struct UsageReport {
     pub notes: Vec<SchemaNote>,
 }
 
+/// What a read should report, from its notes and how it ended. `Ok` only when no counter is
+/// missing or wrong. `Partial` says every reason. A read that stopped early is `Partial` when it
+/// got some data and has `failure` itself only when it got none.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn access_for(
+    notes: &[SchemaNote],
+    failure: Option<pcsleuth_core::Access>,
+    has_data: bool,
+) -> pcsleuth_core::Access {
+    use pcsleuth_core::Access;
+
+    let mut reasons: Vec<String> = notes
+        .iter()
+        .filter(|note| note.is_incomplete())
+        .map(ToString::to_string)
+        .collect();
+    if let Some(failure) = failure {
+        if !has_data {
+            return failure;
+        }
+        reasons.push(format!("the read stopped early: {failure}"));
+    }
+    if reasons.is_empty() {
+        Access::Ok
+    } else {
+        Access::Partial {
+            message: reasons.join("; "),
+        }
+    }
+}
+
 /// Read per app, per hour usage in `[since, until)` from a private copy of `SRUDB.dat`, as the
 /// source contract wants it. See [`read_usage_report`] for the schema notes.
+///
+/// The access is `Ok` only when no counter is missing or wrong. A table or column that is absent,
+/// rows or values that could not be read, and a read that stopped early after getting some data
+/// are each `Partial`, and the message says which, so nothing the notes say is lost here.
 #[cfg(windows)]
 pub fn read_usage(
     db_copy: &std::path::Path,
@@ -102,7 +218,8 @@ pub fn read_usage(
     read_usage_report(db_copy, since, until).usage
 }
 
-/// Like [`read_usage`], with the typed notes about absent tables and columns.
+/// Like [`read_usage`], with the typed notes about absent tables and columns, skipped rows and
+/// unreadable values.
 ///
 /// `db_copy` must be a copy this process may rewrite: if it is a dirty shutdown, its logs (the
 /// `SRU*.log` files beside it) are replayed into it first. The database is otherwise opened
@@ -111,7 +228,8 @@ pub fn read_usage(
 ///
 /// Never panics on bad input: a missing file is [`Access::Missing`](pcsleuth_core::Access), a
 /// locked one is `NeedsAdmin`, and anything else, including a schema this reader does not know, is
-/// `Failed` with the reason. If a read fails part way, `usage.data` keeps what was read.
+/// `Failed` with the reason when nothing could be read. If a read fails part way, `usage.data`
+/// keeps what was read and the access is `Partial`.
 #[cfg(windows)]
 pub fn read_usage_report(
     db_copy: &std::path::Path,
@@ -120,40 +238,141 @@ pub fn read_usage_report(
 ) -> UsageReport {
     use pcsleuth_core::{Access, SourceId, Sourced};
 
-    let report = |access: Access, data: Vec<AppUsage>, notes: Vec<SchemaNote>| UsageReport {
-        usage: Sourced {
-            source: SourceId::Srum,
-            access,
-            data,
-        },
-        notes,
+    let fail = |access: Access| UsageReport {
+        usage: Sourced::unreadable(SourceId::Srum, access),
+        notes: Vec::new(),
     };
-    let fail = |access: Access| report(access, Vec::new(), Vec::new());
 
     if let Err(err) = std::fs::metadata(db_copy) {
         return fail(copy::io_access(&err));
     }
-    let scratch = match copy::ScratchDir::new("srum-read") {
+    let scratch = match scratch::ScratchDir::new("srum-read") {
         Ok(scratch) => scratch,
         Err(err) => return fail(copy::io_access(&err)),
+    };
+    let mut report = read_in(db_copy, scratch.path(), since, until);
+    if let Err(err) = scratch.remove() {
+        report.notes.push(SchemaNote::ScratchNotRemoved {
+            code: err.raw_os_error().unwrap_or(0) as u32,
+        });
+    }
+    report
+}
+
+/// The read itself, with `scratch` as the folder for ESE's temporary files.
+#[cfg(windows)]
+fn read_in(
+    db_copy: &std::path::Path,
+    scratch: &std::path::Path,
+    since: jiff::Timestamp,
+    until: jiff::Timestamp,
+) -> UsageReport {
+    use pcsleuth_core::{SourceId, Sourced};
+
+    let fail = |failure: reader::Failure| UsageReport {
+        usage: Sourced::unreadable(SourceId::Srum, failure.access()),
+        notes: Vec::new(),
     };
     let mut notes = Vec::new();
     match ese::database_is_dirty(db_copy) {
         Ok(false) => {}
         Ok(true) => {
-            if let Err(err) = copy::recover(db_copy, scratch.path()) {
-                return fail(reader::Failure::Ese(err).access());
+            if let Err(err) = copy::recover(db_copy, scratch) {
+                return fail(reader::Failure::Ese(err));
             }
             notes.push(SchemaNote::LogsReplayed);
         }
-        Err(err) => return fail(reader::Failure::Ese(err).access()),
+        Err(err) => return fail(reader::Failure::Ese(err)),
     }
-    let outcome = reader::read_clean(db_copy, scratch.path(), since, until);
+    let outcome = reader::read_clean(db_copy, scratch, since, until);
     notes.extend(outcome.notes);
-    let access = outcome
-        .failure
-        .map_or(Access::Ok, |failure| failure.access());
-    report(access, outcome.usage, notes)
+    let access = access_for(
+        &notes,
+        outcome.failure.map(|failure| failure.access()),
+        !outcome.usage.is_empty(),
+    );
+    UsageReport {
+        usage: Sourced {
+            source: SourceId::Srum,
+            access,
+            data: outcome.usage,
+        },
+        notes,
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    use pcsleuth_core::Access;
+
+    use super::*;
+
+    fn failed() -> Access {
+        Access::Failed {
+            code: 1,
+            message: "x".into(),
+        }
+    }
+
+    #[test]
+    fn a_read_with_nothing_wrong_is_ok_and_housekeeping_notes_do_not_change_that() {
+        assert_eq!(access_for(&[], None, true), Access::Ok);
+        let notes = [
+            SchemaNote::LogsReplayed,
+            SchemaNote::ScratchNotRemoved { code: 5 },
+        ];
+        assert_eq!(access_for(&notes, None, false), Access::Ok);
+    }
+
+    #[test]
+    fn every_note_about_missing_or_wrong_counters_makes_it_partial_with_the_reason() {
+        let notes = [
+            SchemaNote::LogsReplayed,
+            SchemaNote::TableAbsent(SrumTable::EnergyEstimation),
+            SchemaNote::ColumnAbsent {
+                table: SrumTable::NetworkUsage,
+                column: "BytesSent".into(),
+            },
+            SchemaNote::EnergyRecordsSkipped { count: 3 },
+            SchemaNote::RowsSkipped {
+                table: SrumTable::ResourceUsage,
+                count: 1,
+            },
+            SchemaNote::ValuesUnreadable {
+                table: SrumTable::ResourceUsage,
+                count: 4,
+            },
+        ];
+        let Access::Partial { message } = access_for(&notes, None, true) else {
+            panic!("expected Partial");
+        };
+        assert_eq!(
+            message,
+            "the energy estimation table is absent, so its counters read zero; \
+             the network usage table has no BytesSent column; \
+             3 energy records could not be decoded and are not in the sums; \
+             1 row of the resource usage table had no readable time or ids and is not counted; \
+             4 counters in the resource usage table were null or not numbers and read as zero"
+        );
+    }
+
+    #[test]
+    fn failure_is_failed_only_when_nothing_was_read() {
+        assert_eq!(access_for(&[], Some(failed()), false), failed());
+        // Notes do not hide why nothing could be read.
+        let notes = [SchemaNote::TableAbsent(SrumTable::IdMap)];
+        assert_eq!(
+            access_for(&notes, Some(Access::NeedsAdmin), false),
+            Access::NeedsAdmin
+        );
+        let Access::Partial { message } = access_for(&[], Some(failed()), true) else {
+            panic!("expected Partial");
+        };
+        assert!(
+            message.starts_with("the read stopped early: failed (0x00000001)"),
+            "{message}"
+        );
+    }
 }
 
 #[cfg(all(windows, test))]
@@ -163,7 +382,7 @@ mod tests {
     use jiff::Timestamp;
     use pcsleuth_core::{Access, SourceId};
 
-    use super::copy::ScratchDir;
+    use super::scratch::ScratchDir;
     use super::testdb::{self, *};
     use super::*;
 
@@ -204,7 +423,7 @@ mod tests {
         assert_eq!(report.notes, []);
         // alpha/user at 10:00: two readings add up in every table.
         let alpha = bucket(&report, ALPHA, "2026-11-03T10:00:00Z");
-        assert_eq!(alpha.user.as_deref(), Some(SID_USER));
+        assert_eq!(alpha.user, Some(AccountKind::User));
         assert_eq!(
             alpha.usage,
             Usage {
@@ -224,7 +443,7 @@ mod tests {
         assert_eq!(later.usage.energy, 0);
         // Another app and user; network and energy arrive in a later hour than its resource row.
         let beta = bucket(&report, BETA, "2026-11-03T10:00:00Z");
-        assert_eq!(beta.user.as_deref(), Some(SID_SYSTEM));
+        assert_eq!(beta.user, Some(AccountKind::System));
         assert_eq!(
             (beta.usage.bytes_read, beta.usage.bytes_written),
             (100, 200)
@@ -246,11 +465,12 @@ mod tests {
             30
         );
         assert_eq!(
-            bucket(&report, "#77", "2026-11-03T10:00:00Z")
-                .user
-                .as_deref(),
-            Some(SID_USER)
+            bucket(&report, "#77", "2026-11-03T10:00:00Z").user,
+            Some(AccountKind::User)
         );
+        // No SID and no profile folder reaches the output.
+        let everything = format!("{:?}", report.usage.data);
+        assert!(!everything.contains(SID_USER) && !everything.contains(SID_SYSTEM));
         // The reading from the day before is outside the window.
         assert_eq!(report.usage.data.len(), 6);
     }
@@ -299,7 +519,13 @@ mod tests {
             ..Shape::default()
         });
         let report = read(&db);
-        assert_eq!(report.usage.access, Access::Ok);
+        // Every app shows energy 0 here, so the read must not claim to be complete.
+        assert_eq!(
+            report.usage.access,
+            Access::Partial {
+                message: "the energy estimation table is absent, so its counters read zero".into()
+            }
+        );
         assert_eq!(
             report.notes,
             [SchemaNote::TableAbsent(SrumTable::EnergyEstimation)]
@@ -323,6 +549,13 @@ mod tests {
                 column: "BytesSent".into()
             }]
         );
+        // The zeros are not real zeros, so the read is Partial and says which column.
+        assert_eq!(
+            report.usage.access,
+            Access::Partial {
+                message: "the network usage table has no BytesSent column".into()
+            }
+        );
         let alpha = bucket(&report, ALPHA, "2026-11-03T10:00:00Z");
         assert_eq!((alpha.usage.net_sent, alpha.usage.net_received), (0, 1_500));
     }
@@ -335,6 +568,7 @@ mod tests {
         });
         let report = read(&db);
         assert_eq!(report.notes, [SchemaNote::TableAbsent(SrumTable::IdMap)]);
+        assert!(matches!(report.usage.access, Access::Partial { .. }));
         let alpha = bucket(&report, "#1", "2026-11-03T10:00:00Z");
         assert_eq!(alpha.user, None);
         assert_eq!(alpha.usage.cpu_cycles_foreground, 1_500);
@@ -352,9 +586,68 @@ mod tests {
             [SchemaNote::EnergyRecordsSkipped { count: 1 }]
         );
         assert_eq!(
+            report.usage.access,
+            Access::Partial {
+                message: "1 energy record could not be decoded and is not in the sums".into()
+            }
+        );
+        assert_eq!(
             bucket(&report, ALPHA, "2026-11-03T10:00:00Z").usage.energy,
             315
         );
+    }
+
+    #[test]
+    fn rows_and_values_that_cannot_be_read_are_counted_and_make_the_read_partial() {
+        let (_dir, db) = built(Shape {
+            damaged_rows: true,
+            ..Shape::default()
+        });
+        let report = read(&db);
+        // Two resource rows have no usable time or app id; the id map has an entry too large to
+        // read; one resource row has a negative counter and a null one.
+        for note in [
+            SchemaNote::RowsSkipped {
+                table: SrumTable::IdMap,
+                count: 1,
+            },
+            SchemaNote::RowsSkipped {
+                table: SrumTable::ResourceUsage,
+                count: 2,
+            },
+            SchemaNote::ValuesUnreadable {
+                table: SrumTable::ResourceUsage,
+                count: 2,
+            },
+        ] {
+            assert!(
+                report.notes.contains(&note),
+                "{note:?} in {:?}",
+                report.notes
+            );
+        }
+        assert_eq!(report.notes.len(), 3, "{:?}", report.notes);
+        match &report.usage.access {
+            Access::Partial { message } => {
+                assert!(
+                    message.contains("2 rows of the resource usage table"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("2 counters in the resource usage table"),
+                    "{message}"
+                );
+                assert!(message.contains("1 row of the id map table"), "{message}");
+            }
+            other => panic!("expected Partial, got {other}"),
+        }
+        // What could be read is kept, and the damaged row still counts as the zeros it read as.
+        assert_eq!(
+            bucket(&report, ALPHA, "2026-11-03T10:00:00Z").usage.energy,
+            315
+        );
+        let damaged = bucket(&report, ALPHA, "2026-11-03T12:00:00Z");
+        assert_eq!(damaged.usage, Usage::default());
     }
 
     #[test]
@@ -504,6 +797,8 @@ mod tests {
     fn real_copy_shape_counts_and_srumutil_oracle() {
         use std::collections::{BTreeMap, BTreeSet};
 
+        use crate::eventlog::collapse_profile_path;
+
         let given = PathBuf::from(
             std::env::var_os("PCSLEUTH_REAL_SRUDB")
                 .expect("set PCSLEUTH_REAL_SRUDB to the folder holding SRUDB.dat"),
@@ -528,7 +823,7 @@ mod tests {
         let report = read_usage_report(&db, ts("1970-01-01T00:00:00Z"), ts("2100-01-01T00:00:00Z"));
         let data = &report.usage.data;
         let apps: BTreeSet<&str> = data.iter().map(|b| b.app.as_str()).collect();
-        let users: BTreeSet<Option<&str>> = data.iter().map(|b| b.user.as_deref()).collect();
+        let users: BTreeSet<Option<AccountKind>> = data.iter().map(|b| b.user).collect();
         let energy: u64 = data.iter().map(|b| b.usage.energy).sum();
         let on_battery: u64 = data.iter().map(|b| b.usage.energy_on_battery).sum();
         eprintln!(
@@ -590,7 +885,8 @@ mod tests {
                 .then(|| {
                     let time = format!("{}Z", fields[c_time].get(..19)?);
                     Some((
-                        fields[c_app].to_owned(),
+                        // The reader collapses profile folders, so the CSV's names must be too.
+                        collapse_profile_path(fields[c_app]).into_owned(),
                         time.parse::<Timestamp>().ok()?,
                         fields[c_bat].eq_ignore_ascii_case("TRUE"),
                         fields[c_total].parse::<u64>().ok()?,
