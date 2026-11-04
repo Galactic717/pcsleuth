@@ -166,6 +166,20 @@ pub fn install(
     // Before anything is touched: a program file anyone can replace would run as SYSTEM.
     let exe = check_install_location(exe)?;
     let exe = exe.as_path();
+    let manager = open_manager()?;
+    // An existing service is found before the data folder's permissions are touched, so a refused
+    // second install changes nothing.
+    // SAFETY: `manager` is open and the name is a valid HSTRING.
+    if let Ok(existing) = unsafe {
+        OpenServiceW(
+            manager.0,
+            &HSTRING::from(SERVICE_NAME),
+            SERVICE_QUERY_STATUS,
+        )
+    } {
+        drop(Handle(existing));
+        return Err(ServiceError::AlreadyInstalled);
+    }
     let ring = service_ring_path();
     let folder = ring
         .parent()
@@ -180,7 +194,6 @@ pub fn install(
         source,
     })?;
 
-    let manager = open_manager()?;
     let command = HSTRING::from(service_command_line(exe, interval_secs));
     // SAFETY: every string is a valid nul-terminated HSTRING alive for the call; the optional
     // arguments are null, meaning no load order group, tag, dependencies, account or password

@@ -149,9 +149,34 @@ fn elevated_install_start_record_stop_uninstall() {
     assert_eq!(sddl.matches("(A;").count(), 3, "{sddl}");
 
     // A second install is refused, not duplicated.
+    // To show it changes nothing, first give Authenticated Users read access to the folder by
+    // hand; a refused install must not put the permissions back.
+    let grant = Command::new("icacls.exe")
+        .arg(&folder)
+        .args(["/grant", "*S-1-5-11:(OI)(CI)R"])
+        .output()
+        .unwrap();
+    assert!(grant.status.success(), "{grant:?}");
+    let touched = winapi::dacl_sddl(&folder).unwrap();
     let again = Command::new(&copy.exe).arg("install").output().unwrap();
     assert!(!again.status.success());
     assert!(String::from_utf8_lossy(&again.stderr).contains("already installed"));
+    assert_eq!(
+        winapi::dacl_sddl(&folder).unwrap(),
+        touched,
+        "a refused install changed the folder permissions"
+    );
+    // Put it right again: uninstall and install start from nothing, so re-apply by reinstalling.
+    let _ = service::uninstall();
+    let reinstall = Command::new(&copy.exe)
+        .args(["install", "--interval", "2"])
+        .output()
+        .unwrap();
+    assert!(reinstall.status.success(), "{reinstall:?}");
+    assert_eq!(
+        winapi::dacl_sddl(&folder).unwrap().matches("(A;").count(),
+        3
+    );
 
     // Start it, wait for a few rows, and check what was recorded.
     let (code, text) = sc(&["start", SERVICE_NAME]);

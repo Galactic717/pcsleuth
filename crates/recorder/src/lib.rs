@@ -51,6 +51,12 @@ fn under_env(var: &str) -> PathBuf {
 
 /// Where the service keeps its ring: `%ProgramData%\pcsleuth\recorder.ring`.
 pub fn service_ring_path() -> PathBuf {
+    // The shell's known folder, not the environment variable: whoever runs `install` can set
+    // that variable, and the folder must be the real one that only administrators can change.
+    #[cfg(windows)]
+    if let Ok(dir) = winapi::program_data_dir() {
+        return dir.join(APP_DIR).join(RING_FILE);
+    }
     under_env("ProgramData")
 }
 

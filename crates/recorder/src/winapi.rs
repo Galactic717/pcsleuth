@@ -7,6 +7,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use windows::Win32::Foundation::{
@@ -19,10 +20,10 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-    TOKEN_USER, TokenUser,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
-use windows::Win32::Storage::FileSystem::CreateDirectoryW;
+use windows::Win32::Storage::FileSystem::{CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler,
@@ -249,9 +250,85 @@ pub fn protected_folder_sddl(user_sid: &str) -> String {
     format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;{user_sid})")
 }
 
-/// Create `dir` (one level) with the descriptor from [`protected_folder_sddl`], or, if it exists,
-/// replace its permissions with it. Nobody else can read what is inside.
+/// Administrators and SYSTEM: the only owners of an existing data folder that are trusted.
+pub fn owner_is_trusted(sid: &str) -> bool {
+    matches!(sid, "S-1-5-32-544" | "S-1-5-18")
+}
+
+/// The string form of the SID that owns the file or folder at `path`.
+pub fn owner_sid(path: &Path) -> io::Result<String> {
+    let wide_path = wide(path);
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    let mut owner = PSID::default();
+    // SAFETY: `wide_path` is nul-terminated and both out-pointers are valid locals. `owner` points
+    // into `descriptor`, which is freed only after the SID has been converted below.
+    let code = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide_path.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            &mut descriptor,
+        )
+    };
+    win32_result(code)?;
+    let mut text = PWSTR::null();
+    // SAFETY: `owner` is a valid SID inside the live `descriptor`; `text` is a valid out-pointer.
+    let converted = unsafe { ConvertSidToStringSidW(owner, &mut text) };
+    local_free(descriptor.0);
+    converted.map_err(to_io)?;
+    // SAFETY: on success `text` is a nul-terminated string that this function now owns.
+    let sid = unsafe { text.to_string() }.map_err(io::Error::other);
+    local_free(text.0.cast());
+    sid
+}
+
+/// Refuse a folder that already exists unless it is a real folder, not a link, owned by a trusted
+/// SID. Otherwise another user could have made it first and keep control of it, or made it a
+/// junction so that replacing its permissions rewrites those of a folder somewhere else.
+fn check_existing_dir(dir: &Path, trusted: &dyn Fn(&str) -> bool) -> io::Result<()> {
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let refuse = |why: String| io::Error::new(io::ErrorKind::PermissionDenied, why);
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 || !meta.is_dir() {
+        return Err(refuse(format!(
+            "{} is a link or not a folder, so it was left alone; remove it as an administrator \
+             and run install again",
+            dir.display()
+        )));
+    }
+    let owner = owner_sid(dir)?;
+    if !trusted(&owner) {
+        return Err(refuse(format!(
+            "{} already exists and is owned by {owner}, not by Administrators or SYSTEM, so it \
+             was left alone; remove it as an administrator and run install again",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Create `dir` (one level) with the descriptor from [`protected_folder_sddl`], or, if it already
+/// exists, replace its permissions with it. Nobody else can read what is inside.
+///
+/// An existing folder is trusted only if it is a real folder owned by Administrators or SYSTEM
+/// (see `check_existing_dir`); anything else is refused untouched.
 pub fn create_protected_dir(dir: &Path, user_sid: &str) -> io::Result<()> {
+    create_protected_dir_with(dir, user_sid, &owner_is_trusted)
+}
+
+fn create_protected_dir_with(
+    dir: &Path,
+    user_sid: &str,
+    trusted: &dyn Fn(&str) -> bool,
+) -> io::Result<()> {
+    check_existing_dir(dir, trusted)?;
     let sddl = wide(protected_folder_sddl(user_sid));
     let path = wide(dir);
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
@@ -463,7 +540,18 @@ mod tests {
         let file = dir.join("recorder.ring");
         std::fs::write(&file, b"x").unwrap();
         let sid = current_user_sid().unwrap();
-        create_protected_dir(&dir, &sid).unwrap();
+        // The real check refuses this folder: it is owned by the test user, not by an
+        // administrator, and refusing leaves it exactly as it was.
+        // (An elevated token owns what it creates as Administrators, which would be trusted.)
+        if !pcsleuth_sources::power::is_elevated() {
+            let refused = create_protected_dir(&dir, &sid).unwrap_err();
+            assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+            assert!(refused.to_string().contains("owned by"), "{refused}");
+            assert_eq!(dacl_sddl(&dir).unwrap(), before);
+        }
+        // With the owner check set aside (an unelevated test cannot make an administrator-owned
+        // folder), the rest of the path closes the folder down and the file inside follows.
+        create_protected_dir_with(&dir, &sid, &|_| true).unwrap();
         let after = dacl_sddl(&dir).unwrap();
         let inner = dacl_sddl(&file).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -472,6 +560,51 @@ mod tests {
         assert_eq!(after.matches("(A;").count(), 3, "{after}");
         // The file's own permissions followed the folder's.
         assert_eq!(inner.matches("(A;").count(), 3, "{inner}");
+    }
+
+    #[test]
+    fn a_junction_in_place_of_the_folder_is_refused_and_its_target_left_alone() {
+        let base = std::env::temp_dir().join(format!("pcsleuth-junction-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let target = base.join("victim");
+        let link = base.join("pcsleuth");
+        std::fs::create_dir_all(&target).unwrap();
+        // A junction needs no privilege to make, which is the point of the attack.
+        let made = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let before = dacl_sddl(&target).unwrap();
+        let sid = current_user_sid().unwrap();
+        // Even with the owner check waved through, a link is refused.
+        let refused = create_protected_dir_with(&link, &sid, &|_| true).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+        assert!(refused.to_string().contains("link"), "{refused}");
+        assert_eq!(
+            dacl_sddl(&target).unwrap(),
+            before,
+            "the target was rewritten"
+        );
+        // Removing the junction first, so the cleanup cannot follow it.
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn only_administrators_and_system_own_a_trusted_folder() {
+        assert!(owner_is_trusted("S-1-5-32-544"));
+        assert!(owner_is_trusted("S-1-5-18"));
+        assert!(!owner_is_trusted(&current_user_sid().unwrap()));
+        assert!(!owner_is_trusted("S-1-1-0")); // Everyone
+        // And the owner of a file this test makes is read back as the test user.
+        let file = std::env::temp_dir().join(format!("pcsleuth-owner-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let owner = owner_sid(&file).unwrap();
+        let _ = std::fs::remove_file(&file);
+        assert!(owner.starts_with("S-1-5-"), "{owner}");
     }
 
     #[test]
