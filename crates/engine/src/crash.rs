@@ -47,13 +47,7 @@ pub fn event_findings(
     let mut out = Findings::default();
     application_findings(applications, window, &mut out);
     restart_findings(lifecycle, kernel_power, window, &mut out);
-    for event in &lifecycle.data {
-        if let LifecycleEvent::ShutdownInitiated(request) = event
-            && window.contains(request.meta.time)
-        {
-            out.push(shutdown_request(request));
-        }
-    }
+    shutdown_requests(lifecycle, window, &mut out);
     out
 }
 
@@ -516,37 +510,91 @@ fn restart_finding(group: &[&Piece], window: &Window) -> Result<Finding, Finding
     .map(at)
 }
 
-fn shutdown_request(request: &ShutdownInitiated) -> Result<Finding, FindingError> {
-    let mut evidence = stamped(request.to_evidence(), &request.meta);
-    let program = request.process_name().map(str::to_owned);
+/// One finding per program that asked for a shutdown or restart, with how many times. A busy PC
+/// logs hundreds of these, and they are context, not crashes, so they never get one finding each.
+fn shutdown_requests(lifecycle: &Sourced<LifecycleEvent>, window: &Window, out: &mut Findings) {
+    let mut by_program: BTreeMap<String, Vec<&ShutdownInitiated>> = BTreeMap::new();
+    for event in &lifecycle.data {
+        if let LifecycleEvent::ShutdownInitiated(request) = event
+            && window.contains(request.meta.time)
+        {
+            let key = request.process_name().unwrap_or("").to_lowercase();
+            by_program.entry(key).or_default().push(request);
+        }
+    }
+    for requests in by_program.values() {
+        out.push(shutdown_request(requests));
+    }
+}
+
+/// The finding for one program's requests. It cites the newest record only.
+fn shutdown_request(requests: &[&ShutdownInitiated]) -> Result<Finding, FindingError> {
+    let newest = requests
+        .iter()
+        .max_by_key(|r| r.meta.time)
+        .copied()
+        .ok_or(FindingError::Blank("shutdown requests"))?;
+    let count = requests.len();
+    let program = newest.process_name().map(str::to_owned);
+    let mut evidence =
+        stamped(newest.to_evidence(), &newest.meta).with_field("requests", count.to_string());
     if let Some(program) = &program {
         evidence = evidence.with_field("process", program.clone());
     }
-    let reason = request
-        .reason_code
-        .map(|code| {
-            let planned = if request.is_planned() == Some(true) {
-                "marked as planned"
-            } else {
-                "not marked as planned"
-            };
-            format!(" Windows gave reason code 0x{code:x} ({planned}).")
-        })
-        .unwrap_or_default();
+
+    let planned = |code: u32| {
+        if code & 0x8000_0000 != 0 {
+            "marked as planned"
+        } else {
+            "not marked as planned"
+        }
+    };
+    let name = program.as_deref().unwrap_or("A program");
+    let (headline, detail) = if count == 1 {
+        let reason = newest
+            .reason_code
+            .map(|code| format!(" Windows gave reason code 0x{code:x} ({}).", planned(code)))
+            .unwrap_or_default();
+        (
+            format!("{name} asked Windows to shut down or restart"),
+            format!("Windows logged a shutdown request (User32, event 1074).{reason}"),
+        )
+    } else {
+        let mut codes: BTreeMap<u32, usize> = BTreeMap::new();
+        for code in requests.iter().filter_map(|r| r.reason_code) {
+            *codes.entry(code).or_default() += 1;
+        }
+        let mut codes: Vec<(u32, usize)> = codes.into_iter().collect();
+        codes.sort_by_key(|(code, n)| (std::cmp::Reverse(*n), *code));
+        let seen: Vec<String> = codes
+            .iter()
+            .take(3)
+            .map(|(code, n)| format!("0x{code:x} x{n} ({})", planned(*code)))
+            .collect();
+        let reasons = if seen.is_empty() {
+            String::new()
+        } else {
+            format!(" Reason codes seen: {}.", seen.join(", "))
+        };
+        (
+            format!("{name} asked Windows to shut down or restart {count} times"),
+            format!(
+                "Windows logged {count} shutdown requests (User32, event 1074) from this program. \
+                 They are context, not crashes. Only the newest record is cited.{reasons}"
+            ),
+        )
+    };
     let finding = Finding::recorded(
         "crash.shutdown_requested",
         Question::Crash,
+        headline,
         format!(
-            "{} asked Windows to shut down or restart",
-            program.as_deref().unwrap_or("A program")
-        ),
-        format!(
-            "Windows logged a shutdown request (User32, event 1074).{reason} The record does not \
-             say in a language-independent way whether it was a shut down or a restart."
+            "{detail} The record does not say in a language-independent way whether it was a shut \
+             down or a restart."
         ),
         [evidence],
     )?;
-    Ok(match request.meta.time {
+    Ok(match newest.meta.time {
         Some(time) => finding.at(time),
         None => finding,
     })

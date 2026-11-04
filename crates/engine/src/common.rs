@@ -57,17 +57,150 @@ impl Limits {
     }
 }
 
-/// Sort oldest first, keep the most recent `window.limit` dated findings and every undated one.
+/// How serious a kind of finding is (0 first) and what to call the kind in plural.
+///
+/// Rank 0 is trouble with the machine itself, rank 1 is trouble with a named program, a boot or
+/// the battery, and every wake. Rank 2 is background noise that a busy PC makes by the hundred:
+/// shutdown requests, other error reports, firmware slowdowns. The limit keeps rank 0 before
+/// rank 1 before rank 2, and shares each rank between its kinds, so one noisy kind cannot fill it.
+pub fn kind_of(id: &str) -> (u8, &'static str) {
+    match id {
+        "crash.power_lost" | "crash.blue_screen" | "crash.forced_off" => {
+            (0, "restarts without a clean shutdown")
+        }
+        "slow.low_memory" => (0, "low-memory warnings"),
+        "crash.app_crash" => (1, "program crashes"),
+        "crash.app_hang" | "slow.app_hang" => (1, "program hangs"),
+        "crash.wer_report" => (1, "crash reports"),
+        "slow.boot" | "slow.shutdown" | "slow.boot_culprit" | "slow.shutdown_culprit" => {
+            (1, "slow boots and shutdowns")
+        }
+        "slow.recorder_cpu" | "slow.recorder_io" => (1, "busy programs seen by the recorder"),
+        "nosleep.recorder_request" => (1, "power requests seen by the recorder"),
+        "battery.drain" | "battery.drain_apps" => (1, "battery drains"),
+        "wake.sleep_to_hibernate" => (2, "automatic sleep-to-hibernate switches"),
+        "crash.other_reports" => (2, "other error reports"),
+        "crash.shutdown_requested" => (2, "shutdown requests"),
+        "slow.cpu_capped" => (2, "firmware slowdowns"),
+        _ if id.starts_with("wake.") => (1, "wakes"),
+        _ => (1, "other findings"),
+    }
+}
+
+/// Keep `window.limit` dated findings: the more serious ranks first, each rank shared between its
+/// kinds (newest first within a kind). Undated findings are always kept. When some are left out,
+/// a note says how many of which kind and how to see them. Sorted oldest first.
 pub fn finish(
     question: Question,
     window: &Window,
     findings: Vec<Finding>,
     limits: Limits,
 ) -> Answer {
-    let mut merged = merge_timeline(findings);
-    let dated = merged.iter().filter(|f| f.time().is_some()).count();
-    merged.drain(..dated.saturating_sub(window.limit));
+    let (dated, undated): (Vec<Finding>, Vec<Finding>) =
+        findings.into_iter().partition(|f| f.time().is_some());
+    let chosen = choose(&dated, window.limit);
+    let mut slots: Vec<Option<Finding>> = dated.into_iter().map(Some).collect();
+    let mut kept: Vec<Finding> = undated;
+    kept.extend(chosen.iter().filter_map(|&i| slots[i].take()));
+    let left_out: Vec<Finding> = slots.into_iter().flatten().collect();
+
+    let note = left_out_note(question, window, chosen.len(), &left_out);
+    let mut merged = merge_timeline(kept);
+    merged.extend(note);
     Answer::new(question, window.now, merged, limits.0)
+}
+
+/// Indices of the dated findings to keep, in the order they were chosen.
+fn choose(dated: &[Finding], limit: usize) -> Vec<usize> {
+    let kinds: Vec<(u8, &'static str)> = dated.iter().map(|f| kind_of(f.id())).collect();
+    let mut ranks: Vec<u8> = kinds.iter().map(|(rank, _)| *rank).collect();
+    ranks.sort_unstable();
+    ranks.dedup();
+
+    let mut order = Vec::new();
+    for rank in ranks {
+        // Each kind of this rank, newest first, and the kinds with the newest finding first.
+        let mut by_kind: Vec<(&str, Vec<usize>)> = Vec::new();
+        for (i, (_, label)) in kinds.iter().enumerate().filter(|(_, (r, _))| *r == rank) {
+            match by_kind.iter_mut().find(|(known, _)| known == label) {
+                Some((_, indices)) => indices.push(i),
+                None => by_kind.push((label, vec![i])),
+            }
+        }
+        for (_, indices) in &mut by_kind {
+            indices.sort_by_key(|&i| std::cmp::Reverse(dated[i].time()));
+        }
+        by_kind.sort_by_key(|(_, indices)| std::cmp::Reverse(dated[indices[0]].time()));
+        for turn in 0.. {
+            let before = order.len();
+            order.extend(
+                by_kind
+                    .iter()
+                    .filter_map(|(_, indices)| indices.get(turn).copied()),
+            );
+            if order.len() == before {
+                break;
+            }
+        }
+    }
+    order.truncate(limit);
+    order
+}
+
+/// An undated note naming what the limit left out and how to see it, or `None` if nothing was.
+fn left_out_note(
+    question: Question,
+    window: &Window,
+    shown: usize,
+    left_out: &[Finding],
+) -> Option<Finding> {
+    if left_out.is_empty() {
+        return None;
+    }
+    let mut counts: Vec<((u8, &str), usize)> = Vec::new();
+    for finding in left_out {
+        let kind = kind_of(finding.id());
+        match counts.iter_mut().find(|(known, _)| *known == kind) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((kind, 1)),
+        }
+    }
+    counts.sort_by_key(|((rank, label), n)| (*rank, std::cmp::Reverse(*n), *label));
+    let list: Vec<String> = counts
+        .iter()
+        .map(|((_, label), n)| format!("{label} ({n})"))
+        .collect();
+    let n = left_out.len();
+    let source = left_out
+        .iter()
+        .find_map(|f| f.evidence().first().map(|e| e.source))
+        .unwrap_or(SourceId::EventLogSystem);
+    let note = Finding::recorded(
+        format!("{question}.left_out"),
+        question,
+        format!(
+            "{n} more dated {} not shown because of the limit of {}",
+            if n == 1 { "finding is" } else { "findings are" },
+            window.limit
+        ),
+        format!(
+            "Left out: {}. The limit keeps the more serious kinds first and, within a kind, the              newest findings. To see everything, run again with --limit {}, or look at a shorter              period with --since.",
+            list.join(", "),
+            shown + n
+        ),
+        [Evidence::new(source)
+            .at(window.now)
+            .with_field("shown", shown.to_string())
+            .with_field("left_out", n.to_string())
+            .with_field("limit", window.limit.to_string())],
+    );
+    match note {
+        Ok(note) => Some(note),
+        Err(error) => {
+            debug_assert!(false, "the left-out note was refused: {error}");
+            None
+        }
+    }
 }
 
 /// A finding that is `not recorded` and still cites the record that shows the gap.
@@ -338,7 +471,104 @@ mod tests {
             Limits::default(),
         );
         let ids: Vec<_> = answer.findings.iter().map(Finding::id).collect();
-        assert_eq!(ids, ["b", "c", "u"]);
+        assert_eq!(ids, ["b", "c", "u", "wake.left_out"]);
+        let note = answer.findings.last().unwrap();
+        assert_eq!(
+            note.headline(),
+            "1 more dated finding is not shown because of the limit of 2"
+        );
+        assert!(note.explanation().contains("other findings (1)"));
+        assert!(note.explanation().contains("--limit 3"));
+        assert!(note.time().is_none());
+    }
+
+    fn at(text: &str) -> Timestamp {
+        text.parse().unwrap()
+    }
+
+    fn dated(id: &str, time: &str) -> Finding {
+        Finding::not_recorded(id, Question::Crash, "h", "x", NotRecorded::new("w", "c"))
+            .unwrap()
+            .at(at(time))
+    }
+
+    fn window(limit: usize) -> Window {
+        Window {
+            now: at("2026-11-05T00:00:00Z"),
+            since: at("2026-10-01T00:00:00Z"),
+            limit,
+        }
+    }
+
+    #[test]
+    fn serious_kinds_are_kept_before_noisy_ones_whatever_their_age() {
+        let mut findings = vec![
+            dated("crash.power_lost", "2026-10-02T00:00:00Z"),
+            dated("crash.power_lost", "2026-10-03T00:00:00Z"),
+        ];
+        // A flood of newer, less serious findings.
+        for day in 10..30 {
+            findings.push(dated(
+                "crash.shutdown_requested",
+                &format!("2026-10-{day}T00:00:00Z"),
+            ));
+            findings.push(dated(
+                "crash.app_crash",
+                &format!("2026-10-{day}T01:00:00Z"),
+            ));
+        }
+        let answer = finish(Question::Crash, &window(5), findings, Limits::default());
+        let ids: Vec<_> = answer.findings.iter().map(Finding::id).collect();
+        // Both restarts, then the newest crashes, and no shutdown request at all.
+        assert_eq!(ids.iter().filter(|i| **i == "crash.power_lost").count(), 2);
+        assert_eq!(ids.iter().filter(|i| **i == "crash.app_crash").count(), 3);
+        assert!(!ids.contains(&"crash.shutdown_requested"));
+        let note = answer.findings.last().unwrap();
+        assert_eq!(note.id(), "crash.left_out");
+        assert!(
+            note.explanation()
+                .contains("program crashes (17), shutdown requests (20)")
+        );
+        assert!(note.explanation().contains("--limit 42"));
+    }
+
+    #[test]
+    fn kinds_of_one_rank_share_the_limit_so_one_noisy_kind_cannot_fill_it() {
+        let mut findings = Vec::new();
+        for day in 10..20 {
+            findings.push(dated(
+                "slow.cpu_capped",
+                &format!("2026-10-{day}T00:00:00Z"),
+            ));
+            findings.push(dated("slow.app_hang", &format!("2026-10-{day}T00:00:00Z")));
+            findings.push(dated(
+                "slow.boot_culprit",
+                &format!("2026-10-{day}T00:00:00Z"),
+            ));
+        }
+        let answer = finish(Question::Slow, &window(4), findings, Limits::default());
+        let ids: Vec<_> = answer
+            .findings
+            .iter()
+            .filter(|f| f.time().is_some())
+            .map(Finding::id)
+            .collect();
+        // Rank 1 holds the hangs and the boot culprits: two of each. The firmware slowdowns
+        // (rank 2) wait for what is left, which is nothing.
+        assert_eq!(ids.iter().filter(|i| **i == "slow.app_hang").count(), 2);
+        assert_eq!(ids.iter().filter(|i| **i == "slow.boot_culprit").count(), 2);
+        assert!(!ids.contains(&"slow.cpu_capped"));
+    }
+
+    #[test]
+    fn nothing_left_out_means_no_note() {
+        let answer = finish(
+            Question::Crash,
+            &window(5),
+            vec![dated("crash.app_crash", "2026-10-02T00:00:00Z")],
+            Limits::default(),
+        );
+        assert_eq!(answer.findings.len(), 1);
     }
 
     #[test]

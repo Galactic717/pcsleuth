@@ -39,8 +39,8 @@ struct Cli {
     #[arg(long, global = true, value_name = "WHEN", value_parser = since::parse)]
     since: Option<Timestamp>,
 
-    /// Show at most this many dated findings, keeping the most recent. Notes with no date are
-    /// always shown.
+    /// Show at most this many dated findings: the more serious kinds first, then the newest of
+    /// each kind. Notes with no date are always shown, and one says what was left out.
     #[arg(
         long,
         global = true,

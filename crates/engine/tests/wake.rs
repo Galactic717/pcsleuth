@@ -365,7 +365,13 @@ fn the_limit_keeps_the_most_recent_dated_findings() {
         .iter()
         .filter(|f| f.time().is_some())
         .collect();
+    // Wakes outrank the doze records, so the two newest real wakes stay and the doze records go.
     assert_eq!(dated.len(), 2);
     assert!(ids(&answer.findings).contains(&"wake.unknown_source"));
     assert_eq!(dated[1].evidence()[0].record_id.as_deref(), Some("364927"));
+    assert_eq!(dated[0].evidence()[0].record_id.as_deref(), Some("360285"));
+    assert!(by_id(&answer.findings, "wake.sleep_to_hibernate").is_empty());
+    // And the answer says what it left out and how to see it.
+    let note = by_id(&answer.findings, "wake.left_out")[0];
+    assert!(note.explanation().contains("--limit 11"));
 }

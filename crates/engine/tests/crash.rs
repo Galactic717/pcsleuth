@@ -314,10 +314,13 @@ fn a_shutdown_request_names_the_process_and_the_reason_code_in_plain_words() {
     let mut input = input();
     input.lifecycle = lifecycle("user32-1074.xml");
     let answer = crash::answer(&input, &window("2026-11-01T00:00:00Z"));
-    assert_eq!(answer.findings.len(), 4);
+    // Four records from one program are one finding with a count, citing the newest record.
+    assert_eq!(answer.findings.len(), 1);
     let finding = citing(&answer.findings, "365367");
     assert_eq!(finding.id(), "crash.shutdown_requested");
     assert_eq!(finding.confidence(), Confidence::Recorded);
+    assert_eq!(finding.evidence().len(), 1);
+    assert_eq!(finding.evidence()[0].fields["requests"], "4");
 
     let raw = raw_events("user32-1074.xml");
     let typed = ShutdownInitiated::from_raw(&raw[0]).unwrap();
@@ -326,11 +329,20 @@ fn a_shutdown_request_names_the_process_and_the_reason_code_in_plain_words() {
     assert_eq!(finding.evidence()[0].fields["process"], exe);
     assert_eq!(
         finding.headline(),
-        format!("{exe} asked Windows to shut down or restart")
+        format!("{exe} asked Windows to shut down or restart 4 times")
     );
-    // Reason code is shown; the localized texts are never used to say shutdown or restart.
-    assert!(finding.explanation().contains("reason code 0x0"));
-    assert!(finding.explanation().contains("not marked as planned"));
+    // Context, not a crash. Reason codes are shown; the localized texts are never used to say
+    // shutdown or restart.
+    assert!(
+        finding
+            .explanation()
+            .contains("They are context, not crashes")
+    );
+    assert!(
+        finding
+            .explanation()
+            .contains("0x0 x4 (not marked as planned)")
+    );
     let text = format!("{} {}", finding.headline(), finding.explanation());
     assert!(text.is_ascii(), "{text}");
 }
@@ -419,4 +431,52 @@ fn hundreds_of_other_reports_cite_only_the_newest_few() {
             .contains("(CommonKind x20, RareKind x5)")
     );
     assert!(finding.explanation().contains("The newest 10 are cited."));
+}
+
+#[test]
+fn machine_level_events_are_never_pushed_out_by_app_crashes_or_shutdown_requests() {
+    let mut input = input();
+    input.applications = applications("application-error-1000.xml");
+    input.kernel_power = kernel_power("kernel-power-41.xml");
+    input.lifecycle = lifecycle("synthetic-eventlog-6008.xml");
+    input
+        .lifecycle
+        .data
+        .extend(lifecycle("user32-1074.xml").data);
+    let mut small = window("2026-10-01T00:00:00Z");
+    small.limit = 4;
+    let answer = crash::answer(&input, &small);
+
+    let dated: Vec<_> = answer
+        .findings
+        .iter()
+        .filter(|f| f.time().is_some())
+        .collect();
+    assert_eq!(dated.len(), 4);
+    // All three restarts that Windows could not explain, then the newest program crash.
+    assert_eq!(by_id(&answer.findings, "crash.power_lost").len(), 3);
+    assert_eq!(by_id(&answer.findings, "crash.app_crash").len(), 1);
+    assert_eq!(citing(&answer.findings, "170177").id(), "crash.app_crash");
+    // The newest records of all are the shutdown requests, and they are the ones left out.
+    assert!(by_id(&answer.findings, "crash.shutdown_requested").is_empty());
+
+    let note = by_id(&answer.findings, "crash.left_out")[0];
+    assert_eq!(
+        note.headline(),
+        "6 more dated findings are not shown because of the limit of 4"
+    );
+    assert!(
+        note.explanation()
+            .contains("program crashes (5), shutdown requests (1)")
+    );
+    assert!(note.explanation().contains("--limit 10"));
+    assert!(note.time().is_none());
+}
+
+#[test]
+fn nothing_is_left_out_when_the_limit_is_big_enough() {
+    let mut input = input();
+    input.applications = applications("application-error-1000.xml");
+    let answer = crash::answer(&input, &window("2026-10-01T00:00:00Z"));
+    assert!(by_id(&answer.findings, "crash.left_out").is_empty());
 }

@@ -130,9 +130,12 @@ fn the_limit_applies_to_the_whole_timeline() {
     let mut window = window("2026-10-01T00:00:00Z");
     window.limit = 3;
     let answer = timeline::answer(&input(), &window);
-    assert_eq!(answer.findings.len(), 3);
-    // The most recent three, still oldest first.
+    // Three dated findings, still oldest first, and one undated note about the rest.
     let times: Vec<_> = answer.findings.iter().filter_map(|f| f.time()).collect();
     assert_eq!(times.len(), 3);
     assert!(times.windows(2).all(|w| w[0] <= w[1]));
+    assert_eq!(answer.findings.len(), 4);
+    assert_eq!(answer.findings[3].id(), "timeline.left_out");
+    // Restarts Windows could not explain are not pushed out by wakes or shutdown requests.
+    assert!(answer.findings.iter().any(|f| f.id() == "crash.power_lost"));
 }

@@ -87,8 +87,9 @@ fn scope_line(question: Question, scope: &Resolved, zone: &TimeZone) -> String {
         "as you asked"
     };
     format!(
-        "Looked back to {} ({since}). Showing at most {} dated findings ({limit}); notes with no \
-         date are always shown.",
+        "Looked back to {} ({since}). Showing at most {} dated findings ({limit}), the more \
+         serious kinds first and then the newest of each kind; notes with no date are always \
+         shown.",
         time(scope.window.since, zone),
         scope.window.limit
     )
@@ -97,7 +98,9 @@ fn scope_line(question: Question, scope: &Resolved, zone: &TimeZone) -> String {
 fn finding_block(lines: &mut Vec<String>, finding: &Finding, zone: &TimeZone, doctor: bool) {
     lines.push(clean(finding.headline()));
     wrap(lines, finding.explanation(), "  ");
-    if !doctor {
+    // The note about what the limit left out is pcsleuth's own, so it has no confidence.
+    let note = finding.id().ends_with(".left_out");
+    if !doctor && !note {
         lines.push(format!(
             "  Confidence: {} ({})",
             finding.confidence(),
@@ -108,7 +111,7 @@ fn finding_block(lines: &mut Vec<String>, finding: &Finding, zone: &TimeZone, do
         lines.push(format!("  When: {}", time(at, zone)));
     }
 
-    if !finding.evidence().is_empty() && !doctor {
+    if !finding.evidence().is_empty() && !doctor && !note {
         lines.push("  Evidence:".into());
         for evidence in finding.evidence().iter().take(EVIDENCE_SHOWN) {
             lines.push(format!("    {}", evidence_line(evidence, zone)));
@@ -327,7 +330,8 @@ mod tests {
         assert!(text.starts_with("pcsleuth wake - generated 2026-11-03 14:00:00 +02:00\n"));
         assert!(text.contains(
             "Looked back to 2026-10-28 11:00:00 +02:00 (the default, 7 days). Showing at most 20 \
-             dated findings (as you asked); notes with no date are always shown.\n"
+             dated findings (as you asked), the more serious kinds first and then the newest of \
+             each kind; notes with no date are always shown.\n"
         ));
         assert!(text.contains(
             "Woke from sleep: the power button was pressed\n  Windows recorded it.\n  Nothing else was needed.\n  Confidence: recorded (Windows states it directly)\n"
@@ -529,6 +533,28 @@ mod tests {
         let text = human(&answer, &zone(), None);
         assert_eq!(text.matches("Application event log, record").count(), 3);
         assert!(text.contains("    ... and 27 more (all of them are in the --json output)\n"));
+    }
+
+    #[test]
+    fn the_left_out_note_has_no_confidence_or_evidence_lines() {
+        let note = Finding::recorded(
+            "crash.left_out",
+            Question::Crash,
+            "6 more dated findings are not shown because of the limit of 4",
+            "Left out: program crashes (5). To see everything, run again with --limit 10.",
+            [Evidence::new(SourceId::EventLogSystem).with_field("left_out", "6")],
+        )
+        .unwrap();
+        let answer = Answer::new(
+            Question::Crash,
+            ts("2026-11-03T12:00:00Z"),
+            vec![note],
+            vec![],
+        );
+        let text = human(&answer, &zone(), None);
+        assert!(text.contains("6 more dated findings are not shown because of the limit of 4\n"));
+        assert!(text.contains("run again with --limit 10."));
+        assert!(!text.contains("Confidence:") && !text.contains("Evidence:"));
     }
 
     #[test]
