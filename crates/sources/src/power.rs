@@ -20,9 +20,12 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 
-pub use elevate::{OUT_FILE_ARG, RelaunchError, command_line, quote_arg};
+pub use elevate::{
+    OUT_FILE_ARG, RelaunchError, command_line, is_output_path, open_output_file, output_dir_name,
+    quote_arg,
+};
 #[cfg(windows)]
-pub use elevate::{is_elevated, relaunch_elevated};
+pub use elevate::{create_output_dir, is_elevated, relaunch_elevated};
 pub use layout::{
     LayoutError, PowerRequest, REQUEST_TYPES_V4, Reason, RequestType, Requester, WakeTimer,
     filetime_to_timestamp, parse_power_requests, parse_wake_timers,
@@ -32,7 +35,7 @@ pub(crate) use os::access_from_hresult;
 #[cfg(windows)]
 pub use os::{
     armed_devices, execution_state, last_input, power_requests, power_source, sleep_model,
-    sleep_settings, wake_timers,
+    sleep_settings, system_directory, wake_timers,
 };
 
 /// A sleep timeout from a power scheme.
@@ -210,6 +213,21 @@ pub struct ArmedDevice {
     pub name: String,
 }
 
+/// The outcome of reading one power setting, from the Win32 status and the value it filled in.
+///
+/// `Ok(None)` is a scheme that has no such setting (`ERROR_FILE_NOT_FOUND`), which is normal: a
+/// machine with hibernate off has no hibernate timeout. Any other failure is `Err(code)`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn setting_value(status: u32, value: u32) -> Result<Option<u32>, u32> {
+    const ERROR_SUCCESS: u32 = 0;
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    match status {
+        ERROR_SUCCESS => Ok(Some(value)),
+        ERROR_FILE_NOT_FOUND => Ok(None),
+        code => Err(code),
+    }
+}
+
 /// The `NTSTATUS` values that mean "run elevated", as `Access`.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn access_from_ntstatus(status: i32) -> pcsleuth_core::Access {
@@ -299,6 +317,14 @@ mod tests {
         assert_eq!(unknown.ac_line, AcLine::Unknown);
         assert_eq!(unknown.battery_present, None);
         assert!(!unknown.charging);
+    }
+
+    #[test]
+    fn only_a_missing_setting_reads_as_none() {
+        assert_eq!(setting_value(0, 600), Ok(Some(600)));
+        assert_eq!(setting_value(2, 0), Ok(None));
+        assert_eq!(setting_value(5, 0), Err(5));
+        assert_eq!(setting_value(87, 0), Err(87));
     }
 
     #[test]

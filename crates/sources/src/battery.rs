@@ -525,7 +525,7 @@ mod run {
     use std::os::windows::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant};
 
     use pcsleuth_core::Access;
 
@@ -533,26 +533,30 @@ mod run {
     const TIMEOUT: Duration = Duration::from_secs(30);
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    /// A per-run temp file that is deleted when dropped, also on early return.
-    pub(super) struct TempReport(PathBuf);
+    /// A per-run report file inside a fresh directory with a random 128-bit name, so no other
+    /// process can guess the path ahead of time (this may run elevated, writing under the user's
+    /// temp folder). The directory and the file are deleted when this is dropped, also on early
+    /// return.
+    pub(super) struct TempReport {
+        dir: PathBuf,
+        file: PathBuf,
+    }
 
     impl TempReport {
-        pub(super) fn new() -> TempReport {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos());
-            let name = format!("pcsleuth-battery-{}-{nanos}.xml", std::process::id());
-            TempReport(std::env::temp_dir().join(name))
+        pub(super) fn new() -> std::io::Result<TempReport> {
+            let dir = crate::power::create_output_dir()?;
+            let file = dir.join("battery.xml");
+            Ok(TempReport { dir, file })
         }
 
         pub(super) fn path(&self) -> &Path {
-            &self.0
+            &self.file
         }
     }
 
     impl Drop for TempReport {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -567,14 +571,13 @@ mod run {
         }
     }
 
-    /// Run `powercfg` by full path (no `PATH` lookup) and return the file it wrote.
+    /// Run `powercfg` by full path and return the file it wrote. The system directory comes from
+    /// `GetSystemDirectoryW`, never from an environment variable, because this may run elevated.
     pub(super) fn generate() -> Result<TempReport, Access> {
-        let root = std::env::var_os("SystemRoot").ok_or(Access::Failed {
-            code: 0,
-            message: "SystemRoot is not set".into(),
-        })?;
-        let exe = Path::new(&root).join("System32").join("powercfg.exe");
-        let file = TempReport::new();
+        let exe = crate::power::system_directory()
+            .map_err(|e| io_access(&e))?
+            .join("powercfg.exe");
+        let file = TempReport::new().map_err(|e| io_access(&e))?;
         let mut child = Command::new(&exe)
             .args(["/batteryreport", "/xml", "/output"])
             .arg(file.path())
@@ -599,7 +602,12 @@ mod run {
                         message: "powercfg did not finish within 30 seconds".into(),
                     });
                 }
-                Err(e) => return Err(io_access(&e)),
+                Err(e) => {
+                    // Do not leave a child running that nobody is waiting for.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(io_access(&e));
+                }
             }
         };
         if status.success() && file.path().exists() {
@@ -828,12 +836,24 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn temp_report_is_deleted_on_drop() {
-        let file = run::TempReport::new();
+        let file = run::TempReport::new().unwrap();
         std::fs::write(file.path(), b"x").unwrap();
         let path = file.path().to_path_buf();
+        let dir = path.parent().unwrap().to_path_buf();
         assert!(path.exists());
+        // Its own random directory, so the path cannot be planted in advance.
+        assert!(crate::power::is_output_path(&path));
         drop(file);
         assert!(!path.exists());
+        assert!(!dir.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn two_reports_never_share_a_directory() {
+        let a = run::TempReport::new().unwrap();
+        let b = run::TempReport::new().unwrap();
+        assert_ne!(a.path().parent(), b.path().parent());
     }
 
     /// Live read. A machine without a battery gives `Missing`, which is also a pass: the point is

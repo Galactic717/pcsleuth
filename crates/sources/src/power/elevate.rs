@@ -3,13 +3,81 @@
 //!
 //! Quoting is pure and tested everywhere. The UAC path is never called from a test: it needs a
 //! person to click the prompt.
+//!
+//! # The output file
+//!
+//! The elevated copy writes with administrator rights to a path the unelevated parent chose in a
+//! folder the user can write to. To keep another process of the same user from planting a link at
+//! that path and turning the write into an elevated overwrite:
+//!
+//! 1. The parent creates the file's directory with [`create_output_dir`]: a new directory in the
+//!    temp folder whose name is 128 random bits (`pcsleuth-` and 32 hex digits). The path cannot be
+//!    guessed before the directory exists. [`relaunch_elevated`] refuses any other path.
+//! 2. The elevated copy creates the file with [`open_output_file`], which opens with `create_new`
+//!    so it fails if anything, including a link, is already there. It never overwrites.
+//! 3. The parent reads the file and then removes the whole directory, also when the child timed
+//!    out, so a child that outlives the wait has nowhere to write.
 
 use std::fmt;
+use std::fs::File;
+use std::path::Path;
 
 /// The argument that tells the elevated copy where to write its output. [`relaunch_elevated`]
 /// appends it to the arguments it is given, followed by the path, so the command line must accept
-/// `--out-file <path>`.
+/// `--out-file <path>` and open that path with [`open_output_file`].
 pub const OUT_FILE_ARG: &str = "--out-file";
+
+/// Prefix of every output directory name.
+const OUTPUT_DIR_PREFIX: &str = "pcsleuth-";
+
+/// The directory name for 128 random bits: `pcsleuth-` and 32 lower case hex digits.
+pub fn output_dir_name(random: [u8; 16]) -> String {
+    let hex: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{OUTPUT_DIR_PREFIX}{hex}")
+}
+
+/// True when `path` has the shape [`create_output_dir`] makes: a file name inside a directory named
+/// by [`output_dir_name`].
+pub fn is_output_path(path: &Path) -> bool {
+    let dir_name = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str());
+    let named_like_ours = dir_name
+        .and_then(|n| n.strip_prefix(OUTPUT_DIR_PREFIX))
+        .is_some_and(|hex| {
+            hex.len() == 32 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        });
+    named_like_ours && path.file_name().is_some()
+}
+
+/// Open `path` for writing as a brand new file. It fails if the path already exists, as a file or
+/// as a link, so a planted path is never followed or overwritten. The elevated copy writes its
+/// output through this.
+pub fn open_output_file(path: &Path) -> std::io::Result<File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// Create a fresh directory in the temp folder named by 128 random bits and return its path. Put
+/// the output file inside it. The caller removes the directory when done.
+#[cfg(windows)]
+pub fn create_output_dir() -> std::io::Result<std::path::PathBuf> {
+    // The same system generator Rust's own standard library uses; it cannot fail on Windows 10+.
+    windows::core::link!("bcryptprimitives.dll" "system" fn ProcessPrng(data: *mut u8, len: usize) -> i32);
+
+    let mut random = [0u8; 16];
+    // SAFETY: the pointer and length describe `random` exactly.
+    if unsafe { ProcessPrng(random.as_mut_ptr(), random.len()) } == 0 {
+        return Err(std::io::Error::other("the system random generator failed"));
+    }
+    let dir = std::env::temp_dir().join(output_dir_name(random));
+    // `create_dir`, not `create_dir_all`: an existing directory is an error, never reused.
+    std::fs::create_dir(&dir)?;
+    Ok(dir)
+}
 
 /// Quote one argument so `CommandLineToArgvW` and the C runtime read it back unchanged.
 ///
@@ -59,8 +127,12 @@ pub enum RelaunchError {
     Declined,
     /// Windows could not start the elevated copy.
     Failed { code: u32, message: String },
-    /// The elevated copy was still running after the wait limit.
-    TimedOut,
+    /// The elevated copy was still running after the wait limit. `terminated` says whether this
+    /// process managed to end it; an unelevated process often cannot end an elevated one, so the
+    /// caller must remove the output directory either way.
+    TimedOut { terminated: bool },
+    /// `out_file` is not a new file inside a directory from [`create_output_dir`].
+    BadOutFile,
 }
 
 impl fmt::Display for RelaunchError {
@@ -73,7 +145,18 @@ impl fmt::Display for RelaunchError {
                     "could not start the elevated copy (0x{code:08x}): {message}"
                 )
             }
-            RelaunchError::TimedOut => f.write_str("the elevated copy did not finish in time"),
+            RelaunchError::TimedOut { terminated } => write!(
+                f,
+                "the elevated copy did not finish in time ({})",
+                if *terminated {
+                    "it was ended"
+                } else {
+                    "it could not be ended"
+                }
+            ),
+            RelaunchError::BadOutFile => f.write_str(
+                "the output file must be a new file in a directory made by create_output_dir",
+            ),
         }
     }
 }
@@ -119,26 +202,35 @@ pub fn is_elevated() -> bool {
 const ELEVATED_RUN_LIMIT_MS: u32 = 120_000;
 
 /// Start this executable again, elevated, with `args` followed by [`OUT_FILE_ARG`] and `out_file`,
-/// wait for it, and return its exit code. The caller reads `out_file` and deletes it.
+/// wait for it, and return its exit code. The caller reads `out_file`, then removes its directory.
+///
+/// `out_file` must be a file name inside a directory made by [`create_output_dir`] and must not
+/// exist yet, or this returns [`RelaunchError::BadOutFile`] without prompting. The elevated copy
+/// must create the file with [`open_output_file`]. See the module documentation for why.
 ///
 /// This shows the UAC prompt. It uses `ShellExecuteExW` with the `runas` verb, the extended form of
 /// the `ShellExecuteW` call in ADR 0003, because only the extended form hands back the process to
-/// wait on. `out_file` should be a fresh path in the user's temp folder.
+/// wait on. On a timeout it tries to end the elevated copy, which an unelevated process usually
+/// cannot do; the caller's removal of the output directory is what stops a late write.
 ///
 /// Never call this from a test.
 #[cfg(windows)]
-pub fn relaunch_elevated(
-    args: &[String],
-    out_file: &std::path::Path,
-) -> Result<u32, RelaunchError> {
-    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-    use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+pub fn relaunch_elevated(args: &[String], out_file: &Path) -> Result<u32, RelaunchError> {
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
+    };
+    use windows::Win32::UI::Shell::{
+        SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
     use windows::core::PCWSTR;
 
     const ERROR_CANCELLED: u32 = 1223;
 
+    if !is_output_path(out_file) || out_file.exists() {
+        return Err(RelaunchError::BadOutFile);
+    }
     let failed = |code: u32, what: &str| RelaunchError::Failed {
         code,
         message: what.to_owned(),
@@ -155,7 +247,8 @@ pub fn relaunch_elevated(
 
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_NOCLOSEPROCESS,
+        // NOASYNC: the calling thread has no message loop, so the launch must finish before return.
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
         lpVerb: PCWSTR(verb.as_ptr()),
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: PCWSTR(params.as_ptr()),
@@ -184,8 +277,16 @@ pub fn relaunch_elevated(
             Ok(()) => Ok(code),
             Err(e) => Err(failed(e.code().0 as u32, &e.message())),
         }
+    } else if waited == WAIT_TIMEOUT {
+        // SAFETY: `process` is open; ending it is the point. The caller's removal of the output
+        // directory is what stops a copy that survives this.
+        let terminated = unsafe { TerminateProcess(process, 1) }.is_ok();
+        Err(RelaunchError::TimedOut { terminated })
     } else {
-        Err(RelaunchError::TimedOut)
+        // WAIT_FAILED (or an abandoned or other result that a process handle cannot give).
+        // SAFETY: reads the calling thread's last error.
+        let code = unsafe { GetLastError() }.0;
+        Err(failed(code, "waiting for the elevated copy failed"))
     };
     // SAFETY: closed exactly once, after its last use.
     let _ = unsafe { CloseHandle(process) };
@@ -240,6 +341,93 @@ mod tests {
             r#"now --since "2 hours" --out-file "C:\Users\A B\o.json""#
         );
         assert_eq!(command_line::<&str>(&[]), "");
+    }
+
+    #[test]
+    fn output_dir_names_are_128_random_bits_in_hex() {
+        let name = output_dir_name([0xab; 16]);
+        assert_eq!(name, format!("pcsleuth-{}", "ab".repeat(16)));
+        assert_eq!(
+            output_dir_name([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 255]),
+            "pcsleuth-000102030405060708090a0b0c0d0eff"
+        );
+    }
+
+    #[test]
+    fn only_paths_in_a_random_named_directory_are_output_paths() {
+        let dir = std::env::temp_dir().join(output_dir_name([7; 16]));
+        assert!(is_output_path(&dir.join("answer.json")));
+        // Guessable or hand-made places are refused.
+        assert!(!is_output_path(&std::env::temp_dir().join("answer.json")));
+        assert!(!is_output_path(
+            &std::env::temp_dir().join("pcsleuth").join("a.json")
+        ));
+        let upper = std::env::temp_dir().join(format!("pcsleuth-{}", "AB".repeat(16)));
+        assert!(!is_output_path(&upper.join("a.json")));
+        let short = std::env::temp_dir().join(format!("pcsleuth-{}", "ab".repeat(15)));
+        assert!(!is_output_path(&short.join("a.json")));
+        let long = std::env::temp_dir().join(format!("pcsleuth-{}", "ab".repeat(17)));
+        assert!(!is_output_path(&long.join("a.json")));
+        assert!(!is_output_path(Path::new("")));
+        assert!(!is_output_path(Path::new("answer.json")));
+    }
+
+    #[test]
+    fn the_output_file_is_created_new_and_never_overwritten() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("pcsleuth-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("answer.json");
+        let _ = std::fs::remove_file(&path);
+
+        let mut file = open_output_file(&path).unwrap();
+        file.write_all(b"first").unwrap();
+        drop(file);
+        // A second open, as a planted path would be, fails and leaves the content alone.
+        let err = open_output_file(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        // A directory in the way is refused too.
+        let as_dir = dir.join("sub");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(open_output_file(&as_dir).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_output_dir_makes_a_new_random_directory_each_time() {
+        let a = create_output_dir().unwrap();
+        let b = create_output_dir().unwrap();
+        assert_ne!(a, b);
+        for dir in [&a, &b] {
+            assert!(dir.is_dir());
+            assert!(is_output_path(&dir.join("answer.json")));
+            assert_eq!(dir.parent().unwrap(), std::env::temp_dir());
+        }
+        std::fs::remove_dir(&a).unwrap();
+        std::fs::remove_dir(&b).unwrap();
+    }
+
+    /// `relaunch_elevated` refuses a path that is not ours before it shows any prompt, so this is
+    /// safe to run: it never reaches `ShellExecuteExW`.
+    #[cfg(windows)]
+    #[test]
+    fn relaunch_refuses_a_guessable_or_existing_output_path_without_prompting() {
+        let guessable = std::env::temp_dir().join("pcsleuth-out.json");
+        assert_eq!(
+            relaunch_elevated(&["now".to_owned()], &guessable),
+            Err(RelaunchError::BadOutFile)
+        );
+        let dir = create_output_dir().unwrap();
+        let existing = dir.join("answer.json");
+        std::fs::write(&existing, b"planted").unwrap();
+        assert_eq!(
+            relaunch_elevated(&[], &existing),
+            Err(RelaunchError::BadOutFile)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The real parser agrees: whatever we quote comes back as the same arguments.

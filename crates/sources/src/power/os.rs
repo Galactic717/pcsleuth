@@ -11,7 +11,7 @@ use windows::Win32::System::Power::{
     PowerGetActiveScheme, PowerReadACValueIndex, PowerReadDCValueIndex, SYSTEM_POWER_CAPABILITIES,
     SYSTEM_POWER_STATUS, SystemExecutionState, SystemPowerCapabilities, WakeTimerList,
 };
-use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::System::SystemInformation::{GetSystemDirectoryW, GetTickCount};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows::core::{GUID, HRESULT};
 
@@ -19,6 +19,7 @@ use super::layout::{self, REQUEST_TYPES_V4};
 use super::{
     AcDc, ArmedDevice, ExecutionState, LastInput, PowerRequest, PowerSource, SleepModel,
     SleepSettings, Timeout, WakeTimer, WakeTimerPolicy, access_from_ntstatus, idle_from_ticks,
+    setting_value,
 };
 
 // `powrprof!CallNtPowerInformation` refuses levels it does not document (it answers
@@ -61,6 +62,30 @@ pub(crate) fn access_from_hresult(hr: i32) -> Access {
     }
 }
 
+/// The Windows system directory (`C:\Windows\System32`), from `GetSystemDirectoryW`.
+///
+/// Use this, not the `SystemRoot` or `windir` environment variables, to find a system executable
+/// such as `powercfg.exe`. An elevated copy inherits its environment from a process that is not
+/// elevated, and a user can set these variables for their own account, so the environment must not
+/// choose which program runs elevated.
+pub fn system_directory() -> std::io::Result<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+
+    let mut buf = vec![0u16; 260];
+    loop {
+        // SAFETY: the slice is valid and writable for its whole length.
+        let len = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
+        if len == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if len < buf.len() {
+            return Ok(std::ffi::OsString::from_wide(&buf[..len]).into());
+        }
+        // The buffer was too small; `len` is the size needed including the terminator.
+        buf.resize(len + 1, 0);
+    }
+}
+
 // GUIDs of the settings read below, from `winnt.h`.
 const GUID_SLEEP_SUBGROUP: GUID = GUID::from_u128(0x238c9fa8_0aad_41ed_83f4_97be242c8f20);
 const GUID_STANDBY_TIMEOUT: GUID = GUID::from_u128(0x29f6c1db_86da_48c5_9fdb_f2b67b1f44da);
@@ -86,8 +111,10 @@ fn guid_text(g: &GUID) -> String {
 
 /// Standby, hibernate and wake timer settings of the active power scheme, for mains and battery.
 ///
-/// A setting the scheme does not have is `None` in the result; only a failure to find the active
-/// scheme makes the whole read unreadable.
+/// A setting the scheme does not have (`ERROR_FILE_NOT_FOUND`) is `None` in the result and the
+/// read stays [`Access::Ok`]. Any other failure to read a setting leaves it `None` too but sets the
+/// read's access to that failure, with the other settings still in `data`. Failing to find the
+/// active scheme makes the whole read unreadable.
 pub fn sleep_settings() -> Sourced<SleepSettings> {
     let source = SourceId::PowerSettings;
     let mut scheme_ptr: *mut GUID = std::ptr::null_mut();
@@ -101,7 +128,9 @@ pub fn sleep_settings() -> Sourced<SleepSettings> {
     // SAFETY: the buffer came from PowerGetActiveScheme, which documents LocalFree.
     let _ = unsafe { LocalFree(Some(HLOCAL(scheme_ptr.cast()))) };
 
-    let read = |setting: &GUID| -> AcDc<u32> {
+    // The first failure other than "this scheme has no such setting".
+    let mut failure: Option<Access> = None;
+    let mut read = |setting: &GUID| -> AcDc<u32> {
         let mut ac = 0u32;
         let mut dc = 0u32;
         // SAFETY: all GUID pointers are to live locals and the out-pointers are valid.
@@ -124,9 +153,16 @@ pub fn sleep_settings() -> Sourced<SleepSettings> {
                 &mut dc,
             )
         };
+        let mut value = |status: u32, value: u32| match setting_value(status, value) {
+            Ok(value) => value,
+            Err(code) => {
+                failure.get_or_insert_with(|| access_from_win32(code));
+                None
+            }
+        };
         AcDc {
-            ac: (ac_status == ERROR_SUCCESS).then_some(ac),
-            dc: (dc_status == 0).then_some(dc),
+            ac: value(ac_status.0, ac),
+            dc: value(dc_status, dc),
         }
     };
     let timeout = |v: AcDc<u32>| AcDc {
@@ -134,18 +170,21 @@ pub fn sleep_settings() -> Sourced<SleepSettings> {
         dc: v.dc.map(Timeout::from_secs),
     };
     let wake = read(&GUID_ALLOW_RTC_WAKE);
-    Sourced::ok(
+    let standby = read(&GUID_STANDBY_TIMEOUT);
+    let hibernate = read(&GUID_HIBERNATE_TIMEOUT);
+    Sourced {
         source,
-        vec![SleepSettings {
+        access: failure.unwrap_or(Access::Ok),
+        data: vec![SleepSettings {
             scheme: guid_text(&scheme),
-            standby_timeout: timeout(read(&GUID_STANDBY_TIMEOUT)),
-            hibernate_timeout: timeout(read(&GUID_HIBERNATE_TIMEOUT)),
+            standby_timeout: timeout(standby),
+            hibernate_timeout: timeout(hibernate),
             allow_wake_timers: AcDc {
                 ac: wake.ac.map(WakeTimerPolicy::from_index),
                 dc: wake.dc.map(WakeTimerPolicy::from_index),
             },
         }],
-    )
+    }
 }
 
 /// Call `CallNtPowerInformation` for a fixed-size output.
@@ -409,6 +448,17 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn system_directory_is_system32() {
+        let dir = system_directory().unwrap();
+        assert!(dir.join("powercfg.exe").is_file(), "{dir:?}");
+        assert!(dir.join("esentutl.exe").is_file(), "{dir:?}");
+        assert!(
+            dir.file_name().unwrap().eq_ignore_ascii_case("system32"),
+            "{dir:?}"
+        );
     }
 
     #[test]

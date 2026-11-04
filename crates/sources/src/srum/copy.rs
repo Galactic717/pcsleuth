@@ -129,9 +129,10 @@ pub(super) fn is_srum_log(name: &str) -> bool {
         || (generation.len() == 5 && generation.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-fn system32() -> PathBuf {
-    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
-    PathBuf::from(root).join("System32")
+/// The system directory from `GetSystemDirectoryW`, not from the `SystemRoot` environment
+/// variable: this runs elevated, and the environment must not choose which `esentutl.exe` does.
+fn system32() -> Result<PathBuf, Access> {
+    crate::power::system_directory().map_err(|err| io_access(&err))
 }
 
 /// Copy the live SRUM database and its logs out of a volume shadow copy, replay the logs on the
@@ -145,7 +146,7 @@ pub fn snapshot_copy() -> Result<TempCopy, Access> {
     if !is_elevated() {
         return Err(Access::NeedsAdmin);
     }
-    let system32 = system32();
+    let system32 = system32()?;
     let esentutl = system32.join("esentutl.exe");
     let source = system32.join("SRU");
     let dir = ScratchDir::new("srum-copy").map_err(|err| io_access(&err))?;
