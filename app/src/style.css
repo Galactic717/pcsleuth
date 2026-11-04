@@ -58,6 +58,11 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* Author display rules beat the browser's own [hidden] rule, so say it again. */
+[hidden] {
+  display: none !important;
+}
+
 h1,
 h2,
 h3,
