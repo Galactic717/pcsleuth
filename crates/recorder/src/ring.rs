@@ -77,6 +77,8 @@ pub enum RingError {
     BadVersion(u32),
     #[error("ring header is damaged")]
     HeaderCorrupt,
+    #[error("ring file is {found} bytes but its header says {expected}")]
+    WrongLength { expected: u64, found: u64 },
     #[error("file is too short to be a ring file")]
     TooShort,
     #[error(transparent)]
@@ -501,9 +503,12 @@ pub struct RingWriter<S: Storage> {
 impl<S: Storage> RingWriter<S> {
     /// Use `file` as a ring. An empty file is formatted to `total_bytes` (rounded down to whole
     /// blocks, at least two). A valid ring keeps the size it was made with and carries on after its
-    /// newest sample. A file that has our magic and version but a damaged header or the wrong
-    /// length is ours and is formatted afresh. A file that is not ours (wrong magic or version) is
-    /// refused untouched.
+    /// newest sample.
+    ///
+    /// Anything else is refused with the reason and left untouched: not a ring (wrong magic), another
+    /// version, a damaged header, or a length that is not what the header says. History is never
+    /// thrown away on the writer's own initiative; [`RingWriter::reset`] does that, by explicit
+    /// choice.
     pub fn start(
         mut file: S,
         total_bytes: u64,
@@ -514,13 +519,13 @@ impl<S: Storage> RingWriter<S> {
         if len == 0 {
             return Ok(Self::format(file, total_bytes, interval_secs, now)?);
         }
-        let header = match read_header(&mut file) {
-            Ok(h) if h.file_bytes() == len => h,
-            Ok(_) | Err(RingError::HeaderCorrupt) => {
-                return Ok(Self::format(file, total_bytes, interval_secs, now)?);
-            }
-            Err(e) => return Err(e),
-        };
+        let header = read_header(&mut file)?;
+        if header.file_bytes() != len {
+            return Err(RingError::WrongLength {
+                expected: header.file_bytes(),
+                found: len,
+            });
+        }
         let mut newest = 0u64;
         walk(&mut file, |index, count, block| {
             if let Check::Valid { seq, .. } = check_slot(block, index, count) {
@@ -538,6 +543,26 @@ impl<S: Storage> RingWriter<S> {
         };
         writer.write_header()?;
         Ok(writer)
+    }
+
+    /// Throw away what `file` holds and make it a new empty ring of `total_bytes`. This loses the
+    /// history, so it is only for a deliberate request. It still refuses a file that is not a ring
+    /// of this program (wrong magic, another version, too short to tell), so it cannot be used to
+    /// wipe an unrelated file. A damaged header or a wrong length, the cases [`RingWriter::start`]
+    /// refuses, are what it is for.
+    pub fn reset(
+        mut file: S,
+        total_bytes: u64,
+        interval_secs: u32,
+        now: Timestamp,
+    ) -> Result<Self, RingError> {
+        if file.seek(SeekFrom::End(0))? != 0 {
+            match read_header(&mut file) {
+                Ok(_) | Err(RingError::HeaderCorrupt) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Self::format(file, total_bytes, interval_secs, now)?)
     }
 
     fn format(
@@ -617,19 +642,31 @@ impl<S: Storage> RingWriter<S> {
 impl RingWriter<File> {
     /// Open or create the ring at `path` (see [`RingWriter::start`]). The folder must exist.
     pub fn open(path: &Path, total_bytes: u64, interval_secs: u32) -> Result<Self, RingError> {
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        // Share for reading only. Without FILE_SHARE_DELETE the ring cannot be deleted or renamed
-        // out from under the writer, which would go on writing to a file nobody can reach; without
-        // FILE_SHARE_WRITE a second writer cannot open it. Readers (read access only) still can.
-        #[cfg(windows)]
-        std::os::windows::fs::OpenOptionsExt::share_mode(
-            &mut options,
-            1, /* FILE_SHARE_READ */
-        );
-        let file = options.open(path)?;
+        let file = open_for_writing(path)?;
         Self::start(file, total_bytes, interval_secs, Timestamp::now())
     }
+
+    /// Like [`RingWriter::open`], but throws away a damaged ring's history and starts a new empty
+    /// one (see [`RingWriter::reset`]). Only for a deliberate request.
+    pub fn open_reset(
+        path: &Path,
+        total_bytes: u64,
+        interval_secs: u32,
+    ) -> Result<Self, RingError> {
+        let file = open_for_writing(path)?;
+        Self::reset(file, total_bytes, interval_secs, Timestamp::now())
+    }
+}
+
+fn open_for_writing(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    // Share for reading only. Without FILE_SHARE_DELETE the ring cannot be deleted or renamed out
+    // from under the writer, which would go on writing to a file nobody can reach; without
+    // FILE_SHARE_WRITE a second writer cannot open it. Readers (read access only) still can.
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::share_mode(&mut options, 1 /* FILE_SHARE_READ */);
+    options.open(path)
 }
 
 fn read_header<R: Read + Seek>(r: &mut R) -> Result<Header, RingError> {
@@ -935,15 +972,78 @@ mod tests {
         assert_eq!(cursor.into_inner(), other_version);
     }
 
+    /// A ring of three samples, as bytes.
+    fn ring_with_history() -> Vec<u8> {
+        let mut w = ring(4);
+        for n in 1..=3 {
+            w.append(&sample(n)).unwrap();
+        }
+        w.file.into_inner()
+    }
+
     #[test]
-    fn a_damaged_header_on_our_own_file_is_formatted_afresh() {
-        let mut damaged = ring(3).file.into_inner();
-        damaged[24] ^= 0xFF;
+    fn a_damaged_header_is_refused_with_the_reason_and_the_history_is_kept() {
+        let mut bytes = ring_with_history();
+        bytes[24] ^= 0xFF; // the creation time, covered by the header checksum
         let now = Timestamp::from_second(T0).unwrap();
-        let w = RingWriter::start(Cursor::new(damaged), 5 * BLOCK as u64, 30, now).unwrap();
-        assert_eq!(w.header().slot_count, 4);
-        assert_eq!(w.header().interval_secs, 30);
-        assert_eq!(w.file.get_ref().len(), 5 * BLOCK);
+        let mut file = Cursor::new(bytes.clone());
+        let err = RingWriter::start(&mut file, 5 * BLOCK as u64, 30, now)
+            .err()
+            .unwrap();
+        assert!(matches!(err, RingError::HeaderCorrupt), "{err}");
+        assert_eq!(file.into_inner(), bytes, "the file was changed");
+    }
+
+    #[test]
+    fn a_length_that_is_not_the_headers_is_refused_with_the_reason_and_left_alone() {
+        let now = Timestamp::from_second(T0).unwrap();
+        let whole = ring_with_history();
+        let mut longer = whole.clone();
+        longer.extend_from_slice(&[0; 100]);
+        let mut shorter = whole.clone();
+        shorter.truncate(3 * BLOCK);
+        for (bytes, found) in [(longer, 5 * BLOCK + 100), (shorter, 3 * BLOCK)] {
+            let mut file = Cursor::new(bytes.clone());
+            let err = RingWriter::start(&mut file, 0, 60, now).err().unwrap();
+            match err {
+                RingError::WrongLength { expected, found: f } => {
+                    assert_eq!((expected, f), (5 * BLOCK as u64, found as u64));
+                }
+                other => panic!("{other}"),
+            }
+            assert_eq!(file.into_inner(), bytes, "the file was changed");
+        }
+    }
+
+    #[test]
+    fn reset_starts_a_new_ring_only_when_asked_and_only_for_our_own_file() {
+        let now = Timestamp::from_second(T0).unwrap();
+        // A damaged header, and a wrong length: the two cases `start` refuses.
+        let mut damaged = ring_with_history();
+        damaged[24] ^= 0xFF;
+        let mut cut = ring_with_history();
+        cut.truncate(2 * BLOCK);
+        for bytes in [damaged, cut] {
+            let w = RingWriter::reset(Cursor::new(bytes), 5 * BLOCK as u64, 30, now).unwrap();
+            assert_eq!(w.header().slot_count, 4);
+            assert_eq!(w.header().interval_secs, 30);
+            assert_eq!(w.header().next_seq, 1);
+            assert_eq!(w.file.get_ref().len(), 5 * BLOCK);
+            // Empty, with no sample left from before.
+            assert!(scan_of(&w).unwrap().samples.is_empty());
+        }
+        // An empty file is simply formatted.
+        let fresh = RingWriter::reset(Cursor::new(Vec::new()), 4 * BLOCK as u64, 60, now).unwrap();
+        assert_eq!(fresh.header().slot_count, 3);
+        // A file that is not ours, or from another version, or too short to tell, is refused untouched.
+        let mut other_version = ring_with_history();
+        other_version[8..12].copy_from_slice(&9u32.to_le_bytes());
+        let foreign = b"some other program's data, long enough to look like a file".to_vec();
+        for bytes in [foreign, other_version, b"tiny".to_vec()] {
+            let mut file = Cursor::new(bytes.clone());
+            assert!(RingWriter::reset(&mut file, BLOCK as u64 * 4, 60, now).is_err());
+            assert_eq!(file.into_inner(), bytes);
+        }
     }
 
     #[test]

@@ -117,6 +117,71 @@ fn status_of_a_missing_ring_says_so_and_fails() {
     );
 }
 
+fn a_sample(secs: i64) -> ring::Sample {
+    ring::Sample {
+        row: pcsleuth_core::RecorderRow {
+            at: jiff::Timestamp::from_second(T0 + secs).unwrap(),
+            interval_secs: 60,
+            top_cpu: vec![],
+            top_io: vec![],
+            power_requests: vec![],
+        },
+        requests_visible: true,
+        truncated: false,
+    }
+}
+
+#[test]
+fn a_damaged_ring_is_refused_with_the_reason_and_kept_until_reset_is_asked_for() {
+    let dir = Scratch::new("damaged");
+    let path = dir.ring();
+    {
+        let mut w = ring::RingWriter::open(&path, 8 * ring::BLOCK as u64, 60).unwrap();
+        for n in 0..3 {
+            w.append(&a_sample(n)).unwrap();
+        }
+    }
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[24] ^= 0xFF; // the header's creation time, which its checksum covers
+    std::fs::write(&path, &bytes).unwrap();
+    let ring_arg = path.to_str().unwrap();
+
+    // Recording is refused at once, says why and how to start over, and changes nothing.
+    let out = run(&["--foreground", "--ring", ring_arg]);
+    assert_eq!(out.status.code(), Some(1));
+    let message = text(&out.stderr);
+    assert!(
+        message.contains("damaged") && message.contains("reset"),
+        "{message}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    // So does a second recorder-run, and reading it reports the damage rather than panicking.
+    let shown = run(&["status", "--ring", ring_arg]);
+    assert_eq!(shown.status.code(), Some(1));
+    assert!(
+        text(&shown.stdout).contains("damaged"),
+        "{}",
+        text(&shown.stdout)
+    );
+
+    // Only the explicit command starts over.
+    let reset = run(&["reset", "--ring", ring_arg]);
+    assert!(reset.status.success(), "{}", text(&reset.stderr));
+    assert!(text(&reset.stdout).contains("history is gone"));
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), ring::DEFAULT_BYTES);
+    let st = status(&path);
+    assert_eq!((st.access, st.data[0].rows), (Access::Ok, 0));
+
+    // And it will not touch a file that is not a ring.
+    std::fs::write(&path, b"not a ring, just a file somebody cares about").unwrap();
+    let refused = run(&["reset", "--ring", ring_arg]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"not a ring, just a file somebody cares about"
+    );
+}
+
 #[test]
 fn measure_runs_real_ticks_and_reports_cpu_memory_and_bytes() {
     let dir = Scratch::new("measure");

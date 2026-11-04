@@ -88,6 +88,25 @@ mod app {
         Uninstall,
         /// Show what the ring file holds.
         Status,
+        /// Throw away a damaged ring's history and start a new empty one. Only for a file that is a
+        /// ring of this program; stop the recorder first. The service's ring needs an elevated prompt.
+        Reset,
+    }
+
+    /// What to do about a ring the recorder refused to open, when there is something to do.
+    fn ring_hint(e: &pcsleuth_recorder::RingError, path: &std::path::Path) -> String {
+        use pcsleuth_recorder::RingError;
+        match e {
+            RingError::HeaderCorrupt | RingError::WrongLength { .. } => format!(
+                "\nIts history is kept as it is. To throw it away and start a new ring, run:\n    \
+                 pcsleuth-recorder reset --ring \"{}\"",
+                path.display()
+            ),
+            RingError::Io(io) if io.raw_os_error() == Some(32) => {
+                "\nAnother program has it open for writing, probably another recorder.".into()
+            }
+            _ => String::new(),
+        }
     }
 
     pub fn run() -> ExitCode {
@@ -104,6 +123,9 @@ mod app {
             (Some(Command::Uninstall), false, None) => uninstall(),
             (Some(Command::Status), false, None) => {
                 show_status(&cli.ring.unwrap_or_else(default_ring_path))
+            }
+            (Some(Command::Reset), false, None) => {
+                reset(&cli.ring.unwrap_or_else(default_ring_path), cli.interval)
             }
             (None, true, None) => foreground(cli.ring.unwrap_or_else(user_ring_path), interval),
             (None, false, Some(secs)) => {
@@ -238,6 +260,20 @@ mod app {
         }
     }
 
+    fn reset(path: &std::path::Path, interval_secs: u32) -> ExitCode {
+        match RingWriter::open_reset(path, DEFAULT_BYTES, interval_secs) {
+            Ok(ring) => {
+                println!(
+                    "Reset {}: a new empty ring of {} slots. The old history is gone.",
+                    path.display(),
+                    ring.header().slot_count
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => finish(Err(format!("cannot reset {}: {e}", path.display()))),
+        }
+    }
+
     fn show_status(path: &std::path::Path) -> ExitCode {
         let read = status(path);
         let Some(st) = read.data.first() else {
@@ -307,7 +343,13 @@ mod app {
         let secs = u32::try_from(interval.as_secs()).unwrap_or(u32::MAX);
         let mut ring = match RingWriter::open(&ring_path, DEFAULT_BYTES, secs) {
             Ok(ring) => ring,
-            Err(e) => return finish(Err(format!("cannot use {}: {e}", ring_path.display()))),
+            Err(e) => {
+                return finish(Err(format!(
+                    "cannot use {}: {e}{}",
+                    ring_path.display(),
+                    ring_hint(&e, &ring_path)
+                )));
+            }
         };
         let stop = runner::stop_channel();
         if let Err(e) = winapi::stop_on_ctrl_c() {

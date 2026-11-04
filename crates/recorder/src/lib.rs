@@ -94,7 +94,10 @@ fn access_from_error(e: &RingError) -> Access {
             code: ERROR_NOT_SUPPORTED,
             message: e.to_string(),
         },
-        RingError::BadMagic | RingError::HeaderCorrupt | RingError::TooShort => Access::Failed {
+        RingError::BadMagic
+        | RingError::HeaderCorrupt
+        | RingError::TooShort
+        | RingError::WrongLength { .. } => Access::Failed {
             code: ERROR_INVALID_DATA,
             message: e.to_string(),
         },
