@@ -260,6 +260,7 @@ version = "0.1.0"
 dependencies = [
  "jiff",
  "pcsleuth-core",
+ "pcsleuth-recorder",
  "pcsleuth-sources",
 ]
 
@@ -279,6 +280,14 @@ dependencies = [
 [[package]]
 name = "pcsleuth-recorder"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "jiff",
+ "pcsleuth-core",
+ "pcsleuth-sources",
+ "thiserror",
+ "windows",
+]
 
 [[package]]
 name = "pcsleuth-sources"

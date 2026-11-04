@@ -266,6 +266,7 @@ fn recorder_rows_give_sampled_findings_that_state_the_interval() {
         top_cpu: vec![],
         top_io: vec![],
         power_requests: requests,
+        requests_visible: true,
     };
     let held = || RecordedRequest {
         owner: "player.exe".into(),
@@ -316,6 +317,7 @@ fn recorder_rows_before_the_window_are_ignored() {
                 kind: "system".into(),
                 reason: None,
             }],
+            requests_visible: true,
         }],
     );
     let answer = nosleep::answer(&input, &window("2026-11-03T00:00:00Z"));
@@ -323,22 +325,125 @@ fn recorder_rows_before_the_window_are_ignored() {
     assert_eq!(by_id(&answer.findings, "nosleep.past_blockers").len(), 1);
 }
 
+fn empty_row(at: &str, requests_visible: bool) -> RecorderRow {
+    RecorderRow {
+        at: ts(at),
+        interval_secs: 30,
+        top_cpu: vec![],
+        top_io: vec![],
+        power_requests: vec![],
+        requests_visible,
+    }
+}
+
 #[test]
 fn recorder_samples_that_saw_no_request_do_not_prove_there_was_none() {
     let mut input = input();
     input.recorder = Sourced::ok(
         SourceId::Recorder,
-        vec![RecorderRow {
-            at: ts("2026-11-03T20:00:00Z"),
-            interval_secs: 30,
-            top_cpu: vec![],
-            top_io: vec![],
-            power_requests: vec![],
-        }],
+        vec![empty_row("2026-11-03T20:00:00Z", true)],
     );
     let answer = nosleep::answer(&input, &window("2026-11-03T00:00:00Z"));
     let past = by_id(&answer.findings, "nosleep.past_blockers")[0];
     assert_eq!(past.confidence(), Confidence::NotRecorded);
-    assert!(past.explanation().contains("1 recorder sample"));
-    assert!(past.explanation().contains("owners"));
+    let text = past.explanation();
+    assert!(
+        text.contains("looked at power requests in 1 of 1 recorder sample"),
+        "{text}"
+    );
+    assert!(text.contains("does not prove none was held"), "{text}");
+    // Every sample could look, so nothing is said about being blind.
+    assert!(!text.contains("not running as admin"), "{text}");
+}
+
+#[test]
+fn samples_recorded_without_admin_say_nothing_about_what_was_held() {
+    let mut input = input();
+    input.recorder = Sourced::ok(
+        SourceId::Recorder,
+        vec![
+            empty_row("2026-11-03T20:00:00Z", false),
+            empty_row("2026-11-03T20:00:30Z", false),
+        ],
+    );
+    let answer = nosleep::answer(&input, &window("2026-11-03T00:00:00Z"));
+    // No sample could see requests, so there is no "none held" and no recorder finding.
+    assert!(by_id(&answer.findings, "nosleep.recorder_request").is_empty());
+    let past = by_id(&answer.findings, "nosleep.past_blockers")[0];
+    assert_eq!(past.confidence(), Confidence::NotRecorded);
+    let text = past.explanation();
+    assert!(
+        text.contains("took 2 recorder samples in this period, but it was not running as admin"),
+        "{text}"
+    );
+    assert!(
+        text.contains("could not see power requests in any of them"),
+        "{text}"
+    );
+    assert!(text.contains("says nothing about what was held"), "{text}");
+    assert!(!text.contains("none showed one"), "{text}");
+    // And the answer says what would capture it: the recorder with admin.
+    let gap = past.gap().unwrap();
+    assert!(gap.would_capture.contains("running as admin"), "{gap:?}");
+}
+
+#[test]
+fn blind_samples_are_not_counted_as_samples_that_looked() {
+    let held = || RecordedRequest {
+        owner: "player.exe".into(),
+        kind: "system".into(),
+        reason: None,
+    };
+    let seeing = |at: &str| RecorderRow {
+        power_requests: vec![held()],
+        ..empty_row(at, true)
+    };
+    let mut input = input();
+    input.recorder = Sourced::ok(
+        SourceId::Recorder,
+        vec![
+            empty_row("2026-11-03T20:00:00Z", false),
+            seeing("2026-11-03T20:00:30Z"),
+            seeing("2026-11-03T20:01:00Z"),
+        ],
+    );
+    let answer = nosleep::answer(&input, &window("2026-11-03T00:00:00Z"));
+    let finding = by_id(&answer.findings, "nosleep.recorder_request")[0];
+    // 2 of the 2 samples that could look, not 2 of 3.
+    assert_eq!(
+        finding.headline(),
+        "player.exe held a system power request in 2 of 2 recorder samples"
+    );
+    assert_eq!(finding.evidence()[0].fields["samples"], "2/2");
+    assert!(
+        finding
+            .explanation()
+            .contains("1 of the 3 samples could not see power requests"),
+        "{}",
+        finding.explanation()
+    );
+    assert!(by_id(&answer.findings, "nosleep.past_blockers").is_empty());
+}
+
+#[test]
+fn a_partly_blind_recorder_that_saw_nothing_says_how_many_could_not_look() {
+    let mut input = input();
+    input.recorder = Sourced::ok(
+        SourceId::Recorder,
+        vec![
+            empty_row("2026-11-03T20:00:00Z", true),
+            empty_row("2026-11-03T20:00:30Z", false),
+            empty_row("2026-11-03T20:01:00Z", false),
+        ],
+    );
+    let answer = nosleep::answer(&input, &window("2026-11-03T00:00:00Z"));
+    let text = by_id(&answer.findings, "nosleep.past_blockers")[0].explanation();
+    assert!(
+        text.contains("looked at power requests in 1 of 3 recorder samples"),
+        "{text}"
+    );
+    assert!(
+        text.contains("The other 2 could not see power requests"),
+        "{text}"
+    );
 }
