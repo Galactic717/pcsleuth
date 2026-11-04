@@ -240,6 +240,7 @@ dependencies = [
  "jiff",
  "pcsleuth-core",
  "pcsleuth-engine",
+ "pcsleuth-sources",
  "serde_json",
 ]
 
@@ -259,6 +260,8 @@ version = "0.1.0"
 dependencies = [
  "jiff",
  "pcsleuth-core",
+ "pcsleuth-sources",
+ "serde_json",
 ]
 
 [[package]]

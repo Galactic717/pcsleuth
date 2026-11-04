@@ -17,4 +17,6 @@ clap.workspace = true
 jiff.workspace = true
 pcsleuth-core.workspace = true
 pcsleuth-engine.workspace = true
+# Only for `--elevate` (the UAC relaunch and the output file); every read goes through the engine.
+pcsleuth-sources.workspace = true
 serde_json.workspace = true
