@@ -1,0 +1,163 @@
+{
+  "schema": 1,
+  "env": {
+    "tag": "laptop",
+    "elevated": false,
+    "os_build": "10.0.26300",
+    "git_commit": "cb1e52204688",
+    "git_dirty": false,
+    "date": "2026-11-04T00:12:31.6978354Z"
+  },
+  "summary": {
+    "true_positive": 0,
+    "honest": 4,
+    "miss": 4,
+    "silent": 0,
+    "false_attribution": 0,
+    "unverified": 0,
+    "not_run": 2,
+    "observable_scored": 4,
+    "observable_found": 0,
+    "unobservable_scored": 4,
+    "unobservable_honest": 4,
+    "honest_by_placeholder": 4,
+    "points": 0,
+    "possible": 8
+  },
+  "scenarios": [
+    {
+      "name": "crash-app-error",
+      "question": "crash",
+      "observable": "yes",
+      "why": null,
+      "status": "scored",
+      "outcome": "miss",
+      "detail": "observable, but no cause named",
+      "named": [],
+      "extras": 0,
+      "placeholder": true,
+      "injected_record_ids": [
+        "173025"
+      ]
+    },
+    {
+      "name": "hang-app-hang",
+      "question": "crash",
+      "observable": "yes",
+      "why": null,
+      "status": "scored",
+      "outcome": "miss",
+      "detail": "observable, but no cause named",
+      "named": [],
+      "extras": 0,
+      "placeholder": true,
+      "injected_record_ids": [
+        "173030"
+      ]
+    },
+    {
+      "name": "cpu-hog-live",
+      "question": "now",
+      "observable": "yes",
+      "why": null,
+      "status": "scored",
+      "outcome": "miss",
+      "detail": "observable, but no cause named",
+      "named": [],
+      "extras": 0,
+      "placeholder": true,
+      "injected_record_ids": []
+    },
+    {
+      "name": "disk-hog-live",
+      "question": "now",
+      "observable": "yes",
+      "why": null,
+      "status": "scored",
+      "outcome": "miss",
+      "detail": "observable, but no cause named",
+      "named": [],
+      "extras": 0,
+      "placeholder": true,
+      "injected_record_ids": []
+    },
+    {
+      "name": "power-request-live",
+      "question": "nosleep",
+      "observable": "no",
+      "why": "needs admin: live power requests with their owners",
+      "status": "scored",
+      "outcome": "honest",
+      "detail": "not observable, and the answer says so",
+      "named": [],
+      "extras": 0,
+      "placeholder": true,
+      "injected_record_ids": []
+    },
+    {
+      "name": "wake-timer-live",
+      "question": "wake",
+      "observable": "no",
+      "why": "needs admin: live wake timers",
+      "status": "scored",
+      "outcome": "honest",
+      "detail": "not observable, and the answer says so",
+      "named": [],
+      "extras": 0,
+      "placeholder": true,
+      "injected_record_ids": []
+    },
+    {
+      "name": "power-request-past",
+      "question": "nosleep",
+      "observable": "no",
+      "why": "a released power request leaves no record; only the recorder keeps them",
+      "status": "scored",
+      "outcome": "honest",
+      "detail": "not observable, and the answer says so",
+      "named": [],
+      "extras": 0,
+      "placeholder": true,
+      "injected_record_ids": []
+    },
+    {
+      "name": "cpu-hog-past",
+      "question": "slow",
+      "observable": "no",
+      "why": "a finished CPU hog leaves no record unless the recorder ran",
+      "status": "scored",
+      "outcome": "honest",
+      "detail": "not observable, and the answer says so",
+      "named": [],
+      "extras": 0,
+      "placeholder": true,
+      "injected_record_ids": []
+    },
+    {
+      "name": "sleep-timer-wake",
+      "question": "wake",
+      "observable": "unverified",
+      "why": "Windows names the wake source type; whether it names the timer owner is unknown until run on hardware",
+      "status": "not_run",
+      "outcome": null,
+      "detail": "sleep scenario: skipped; pass --sleep and type the confirmation to run it",
+      "named": [],
+      "extras": 0,
+      "placeholder": false,
+      "injected_record_ids": []
+    },
+    {
+      "name": "sleep-hibernate-timer-wake",
+      "question": "wake",
+      "observable": "no",
+      "why": "a hibernate resume usually reports an unknown wake source; the firmware does not say",
+      "status": "not_run",
+      "outcome": null,
+      "detail": "sleep scenario: skipped; pass --sleep and type the confirmation to run it",
+      "named": [],
+      "extras": 0,
+      "placeholder": false,
+      "injected_record_ids": []
+    }
+  ]
+}
