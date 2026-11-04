@@ -3,15 +3,22 @@
 //!
 //! A task wakes the computer only when its settings have `WakeToRun` on. Without admin the API
 //! shows only part of the task tree. That is reported as data: [`TaskScan`] names every folder and
-//! task it could not open, and the read's access is [`Access::NeedsAdmin`] when anything was
-//! denied, with the tasks that were readable still in `data`.
+//! task it could not open or read, and the read's access says how far to trust the list:
+//!
+//! 1. any folder or task denied: [`Access::NeedsAdmin`], with what could be read still in `data`;
+//! 2. otherwise any other failure while walking (a task deleted mid-scan, a broken collection):
+//!    [`Access::Failed`], again with what could be read;
+//! 3. otherwise, when the scan ran unelevated: [`Access::NeedsAdmin`]. Nothing was denied, but a
+//!    task hidden from this user by its permissions is simply not listed, and nothing can count
+//!    what is not listed, so "no wake tasks" is not a complete answer;
+//! 4. otherwise [`Access::Ok`].
 
 use jiff::Timestamp;
 use jiff::civil::date;
 use jiff::tz::TimeZone;
-
+use pcsleuth_core::Access;
 #[cfg(windows)]
-use pcsleuth_core::{Access, SourceId, Sourced};
+use pcsleuth_core::{SourceId, Sourced};
 
 /// Whether a task can run now, from `TASK_STATE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,8 +47,9 @@ impl TaskState {
 pub struct WakeTask {
     /// Full path in the task tree, such as `\Microsoft\Windows\UpdateOrchestrator\Reboot`.
     pub path: String,
-    /// The task's own switch. A disabled task never wakes anything.
-    pub enabled: bool,
+    /// The task's own switch. A disabled task never wakes anything. `None` when it could not be
+    /// read, which is also listed in [`TaskScan::unreadable_tasks`].
+    pub enabled: Option<bool>,
     pub state: TaskState,
     /// When the scheduler will next start it, if it knows.
     pub next_run: Option<Timestamp>,
@@ -55,16 +63,55 @@ pub struct TaskScan {
     /// is not listed at all, and nothing can count what is not listed, so "no wake tasks" is
     /// complete only when this is true.
     pub elevated: bool,
-    /// Tasks with `WakeToRun` set, in tree order.
+    /// Tasks with `WakeToRun` set, in path order.
     pub wake_tasks: Vec<WakeTask>,
     /// Task folders opened and listed.
     pub folders_scanned: u32,
     /// Tasks whose settings were read, wake or not.
     pub tasks_seen: u32,
-    /// Folders that could not be opened or listed. Their tasks are not in the counts.
+    /// Folders, or parts of a folder (its subfolder list, its task list), that could not be read.
+    /// Whatever was behind them is not in the counts.
     pub unreadable_folders: Vec<String>,
-    /// Tasks seen in a listing whose settings could not be read.
+    /// Tasks that could not be read, or whose state could not be read. A name here may also be in
+    /// `wake_tasks`, with the unreadable field left unknown.
     pub unreadable_tasks: Vec<String>,
+}
+
+/// What went wrong during a walk, kept apart so that "denied" can outrank everything else.
+#[derive(Debug, Default)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct Problems {
+    denied: bool,
+    other: Option<Access>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl Problems {
+    const E_ACCESSDENIED: u32 = 0x8007_0005;
+
+    /// Record a failed COM call. Access denied is remembered as such; any other `HRESULT` is kept
+    /// as a plain failure, the first one only. A task-level error is never "missing": a task that
+    /// disappeared mid-scan says nothing about whether the scheduler exists.
+    fn note(&mut self, code: u32, message: String) {
+        if code == Self::E_ACCESSDENIED {
+            self.denied = true;
+        } else if self.other.is_none() {
+            self.other = Some(Access::Failed { code, message });
+        }
+    }
+
+    /// The access for the whole read, by the order in the module documentation.
+    fn access(self, elevated: bool) -> Access {
+        if self.denied {
+            Access::NeedsAdmin
+        } else if let Some(other) = self.other {
+            other
+        } else if !elevated {
+            Access::NeedsAdmin
+        } else {
+            Access::Ok
+        }
+    }
 }
 
 /// An OLE automation `DATE` (days since 1899-12-30, local time) as a timestamp in `tz`.
@@ -72,7 +119,7 @@ pub struct TaskScan {
 /// The Task Scheduler returns 0 when a time does not exist (a task that never ran); that and any
 /// value that is not a plausible date give `None`.
 pub fn ole_date_to_timestamp(value: f64, tz: &TimeZone) -> Option<Timestamp> {
-    if !value.is_finite() || value < 1.0 || value > 2_958_465.0 {
+    if !value.is_finite() || !(1.0..=2_958_465.0).contains(&value) {
         return None;
     }
     let days = value.floor();
@@ -86,8 +133,8 @@ pub fn ole_date_to_timestamp(value: f64, tz: &TimeZone) -> Option<Timestamp> {
 
 /// Walk the whole task tree and return the tasks that may wake the machine.
 ///
-/// A scheduler that cannot be reached at all is [`Access::Failed`]. A tree that was only partly
-/// readable is [`Access::NeedsAdmin`] with what could be read; see [`TaskScan`].
+/// A scheduler that cannot be reached at all is unreadable. Otherwise the access follows the order
+/// in the module documentation, and `data` holds one [`TaskScan`] with whatever could be read.
 #[cfg(windows)]
 pub fn wake_tasks() -> Sourced<TaskScan> {
     let source = SourceId::ScheduledTasks;
@@ -96,21 +143,11 @@ pub fn wake_tasks() -> Sourced<TaskScan> {
     drop(com);
     match result {
         Err(access) => Sourced::unreadable(source, access),
-        Ok((scan, other_failure)) => {
-            let access = match (
-                other_failure,
-                scan.unreadable_folders.is_empty() && scan.unreadable_tasks.is_empty(),
-            ) {
-                (Some(access), _) => access,
-                (None, true) => Access::Ok,
-                (None, false) => Access::NeedsAdmin,
-            };
-            Sourced {
-                source,
-                access,
-                data: vec![scan],
-            }
-        }
+        Ok((scan, problems)) => Sourced {
+            source,
+            access: problems.access(scan.elevated),
+            data: vec![scan],
+        },
     }
 }
 
@@ -126,12 +163,11 @@ mod com {
     use windows::Win32::System::Variant::{VARIANT, VT_I4};
     use windows::core::BSTR;
 
-    use super::{TaskScan, TaskState, WakeTask, ole_date_to_timestamp};
+    use super::{Problems, TaskScan, TaskState, WakeTask, ole_date_to_timestamp};
     use crate::power::access_from_hresult;
 
     /// `TASK_ENUM_HIDDEN`: include hidden tasks in a listing.
     const TASK_ENUM_HIDDEN: i32 = 1;
-    const E_ACCESSDENIED: u32 = 0x8007_0005;
 
     /// COM initialised for the current thread, undone on drop. If the thread already has COM in
     /// another apartment mode that is fine: the objects below work in it.
@@ -165,12 +201,15 @@ mod com {
         variant
     }
 
-    fn denied(e: &windows::core::Error) -> bool {
-        e.code().0 as u32 == E_ACCESSDENIED
+    impl Problems {
+        fn fail(&mut self, e: &windows::core::Error) {
+            self.note(e.code().0 as u32, e.message());
+        }
     }
 
-    /// Returns the scan plus the first failure that was not "access denied", if any.
-    pub(super) fn scan() -> Result<(TaskScan, Option<Access>), Access> {
+    /// Walk the tree. An `Err` means the scheduler itself could not be reached; everything else is
+    /// recorded in the scan and in the returned [`Problems`].
+    pub(super) fn scan() -> Result<(TaskScan, Problems), Access> {
         let tz = jiff::tz::TimeZone::system();
         // SAFETY: standard COM object creation with a valid CLSID.
         let service: ITaskService =
@@ -185,12 +224,7 @@ mod com {
             elevated: crate::power::is_elevated(),
             ..TaskScan::default()
         };
-        let mut other: Option<Access> = None;
-        let mut note = |e: &windows::core::Error, other: &mut Option<Access>| {
-            if !denied(e) && other.is_none() {
-                *other = Some(access_from_hresult(e.code().0));
-            }
-        };
+        let mut problems = Problems::default();
         let mut pending = vec![String::from("\\")];
         while let Some(path) = pending.pop() {
             // SAFETY: `service` is connected and the path is a valid BSTR.
@@ -198,36 +232,48 @@ mod com {
             {
                 Ok(folder) => folder,
                 Err(e) => {
-                    note(&e, &mut other);
+                    problems.fail(&e);
                     scan.unreadable_folders.push(path);
                     continue;
                 }
             };
-            read_tasks(&folder, &path, &tz, &mut scan, &mut other, &mut note);
+            read_tasks(&folder, &path, &tz, &mut scan, &mut problems);
             // SAFETY: `folder` is a live ITaskFolder.
-            match unsafe { folder.GetFolders(0) } {
-                Ok(children) => {
-                    // SAFETY: `children` is a live collection; items are 1-based.
-                    let count = unsafe { children.Count() }.unwrap_or(0);
-                    for i in 1..=count {
-                        // SAFETY: as above, `i` is within 1..=Count.
-                        if let Ok(child) = unsafe { children.get_Item(&index(i)) }
-                            && let Ok(child_path) = unsafe { child.Path() }
-                        {
-                            pending.push(child_path.to_string());
-                        }
-                    }
-                }
+            let children = match unsafe { folder.GetFolders(0) } {
+                Ok(children) => children,
                 Err(e) => {
-                    note(&e, &mut other);
-                    scan.unreadable_folders.push(path);
+                    problems.fail(&e);
+                    scan.unreadable_folders.push(format!("{path} (subfolders)"));
+                    continue;
+                }
+            };
+            // SAFETY: `children` is a live collection; items are 1-based.
+            let count = match unsafe { children.Count() } {
+                Ok(count) => count,
+                Err(e) => {
+                    problems.fail(&e);
+                    scan.unreadable_folders.push(format!("{path} (subfolders)"));
+                    continue;
+                }
+            };
+            for i in 1..=count {
+                // SAFETY: `i` is within 1..=Count and the child is a live ITaskFolder.
+                let child_path =
+                    unsafe { children.get_Item(&index(i)).and_then(|child| child.Path()) };
+                match child_path {
+                    Ok(child_path) => pending.push(child_path.to_string()),
+                    Err(e) => {
+                        problems.fail(&e);
+                        scan.unreadable_folders
+                            .push(format!("{path} (subfolder {i})"));
+                    }
                 }
             }
         }
         scan.wake_tasks.sort_by(|a, b| a.path.cmp(&b.path));
         scan.unreadable_folders.sort();
         scan.unreadable_folders.dedup();
-        Ok((scan, other))
+        Ok((scan, problems))
     }
 
     fn read_tasks(
@@ -235,30 +281,46 @@ mod com {
         path: &str,
         tz: &jiff::tz::TimeZone,
         scan: &mut TaskScan,
-        other: &mut Option<Access>,
-        note: &mut impl FnMut(&windows::core::Error, &mut Option<Access>),
+        problems: &mut Problems,
     ) {
         // SAFETY: `folder` is a live ITaskFolder.
         let tasks = match unsafe { folder.GetTasks(TASK_ENUM_HIDDEN) } {
             Ok(tasks) => tasks,
             Err(e) => {
-                note(&e, other);
+                problems.fail(&e);
                 scan.unreadable_folders.push(path.to_owned());
                 return;
             }
         };
-        scan.folders_scanned += 1;
         // SAFETY: `tasks` is a live collection; items are 1-based.
-        let count = unsafe { tasks.Count() }.unwrap_or(0);
+        let count = match unsafe { tasks.Count() } {
+            Ok(count) => count,
+            Err(e) => {
+                problems.fail(&e);
+                scan.unreadable_folders.push(format!("{path} (tasks)"));
+                return;
+            }
+        };
+        scan.folders_scanned += 1;
         for i in 1..=count {
             // SAFETY: `i` is within 1..=Count.
-            let Ok(task) = (unsafe { tasks.get_Item(&index(i)) }) else {
-                continue;
+            let task = match unsafe { tasks.get_Item(&index(i)) } {
+                Ok(task) => task,
+                Err(e) => {
+                    problems.fail(&e);
+                    scan.unreadable_tasks.push(format!("{path} (task {i})"));
+                    continue;
+                }
             };
             // SAFETY: `task` is a live IRegisteredTask.
-            let task_path = unsafe { task.Path() }
-                .map(|p| p.to_string())
-                .unwrap_or_default();
+            let task_path = match unsafe { task.Path() } {
+                Ok(task_path) => task_path.to_string(),
+                Err(e) => {
+                    problems.fail(&e);
+                    scan.unreadable_tasks.push(format!("{path} (task {i})"));
+                    continue;
+                }
+            };
             // SAFETY: as above.
             let wake = unsafe {
                 task.Definition().and_then(|d| d.Settings()).and_then(|s| {
@@ -269,7 +331,7 @@ mod com {
             let wake = match wake {
                 Ok(flag) => flag,
                 Err(e) => {
-                    note(&e, other);
+                    problems.fail(&e);
                     scan.unreadable_tasks.push(task_path);
                     continue;
                 }
@@ -279,10 +341,19 @@ mod com {
                 continue;
             }
             // SAFETY: `task` is a live IRegisteredTask; each property read is independent.
-            let (enabled, state, next, last) = unsafe {
+            let enabled = match unsafe { task.Enabled() } {
+                Ok(flag) => Some(flag.as_bool()),
+                Err(e) => {
+                    problems.fail(&e);
+                    scan.unreadable_tasks
+                        .push(format!("{task_path} (enabled state)"));
+                    None
+                }
+            };
+            // SAFETY: as above. An unreadable state or time stays unknown, which the types allow.
+            let (state, next, last) = unsafe {
                 (
-                    task.Enabled().map(|b| b.as_bool()).unwrap_or(false),
-                    task.State().map(|s| s.0).unwrap_or(0),
+                    task.State().map_or(0, |s| s.0),
                     task.NextRunTime().ok(),
                     task.LastRunTime().ok(),
                 )
@@ -348,37 +419,106 @@ mod tests {
         assert_eq!(TaskState::from_raw(99), TaskState::Unknown);
     }
 
-    /// Live read. Without admin the tree is partly closed, which must show as `NeedsAdmin` with the
-    /// readable tasks still present, never as a failure.
+    const DENIED: u32 = 0x8007_0005;
+    const NOT_FOUND: u32 = 0x8007_0002;
+
+    fn problems(codes: &[u32]) -> Problems {
+        let mut p = Problems::default();
+        for code in codes {
+            p.note(*code, format!("code {code:#x}"));
+        }
+        p
+    }
+
+    #[test]
+    fn an_elevated_clean_scan_is_ok() {
+        assert_eq!(problems(&[]).access(true), Access::Ok);
+    }
+
+    #[test]
+    fn an_unelevated_clean_scan_is_still_not_complete() {
+        // Nothing was denied, but permission-hidden tasks are invisible, so it cannot say "none".
+        assert_eq!(problems(&[]).access(false), Access::NeedsAdmin);
+    }
+
+    #[test]
+    fn denied_wins_over_every_other_failure() {
+        for elevated in [false, true] {
+            assert_eq!(
+                problems(&[NOT_FOUND, DENIED]).access(elevated),
+                Access::NeedsAdmin
+            );
+            assert_eq!(
+                problems(&[DENIED, NOT_FOUND]).access(elevated),
+                Access::NeedsAdmin
+            );
+        }
+    }
+
+    #[test]
+    fn a_vanished_task_is_a_failure_never_missing() {
+        // 0x80070002 is ERROR_FILE_NOT_FOUND. As a task-level error it must not make the whole
+        // source "missing"; it is a plain failure, whether or not the scan was elevated.
+        for elevated in [false, true] {
+            assert_eq!(
+                problems(&[NOT_FOUND]).access(elevated),
+                Access::Failed {
+                    code: NOT_FOUND,
+                    message: "code 0x80070002".into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_non_denied_failure_is_the_one_reported() {
+        let access = problems(&[NOT_FOUND, 0x8000_4005]).access(true);
+        assert!(matches!(
+            access,
+            Access::Failed {
+                code: NOT_FOUND,
+                ..
+            }
+        ));
+    }
+
+    /// Live read. The tree may be partly closed or a task may vanish mid-scan; both must come back
+    /// as typed access with the readable tasks still present. Unelevated, a scan is never `Ok`.
     #[cfg(windows)]
     #[test]
     fn live_wake_tasks() {
         let read = wake_tasks();
         assert_eq!(read.source, SourceId::ScheduledTasks);
-        assert!(
-            matches!(read.access, Access::Ok | Access::NeedsAdmin),
-            "{read:?}"
-        );
         let scan = &read.data[0];
+        let unreadable = !scan.unreadable_folders.is_empty() || !scan.unreadable_tasks.is_empty();
+        match &read.access {
+            Access::Ok => assert!(scan.elevated && !unreadable, "{read:?}"),
+            Access::NeedsAdmin => {}
+            Access::Failed { .. } => assert!(unreadable, "{read:?}"),
+            other => panic!("unexpected {other}"),
+        }
+        if !scan.elevated {
+            assert!(matches!(
+                read.access,
+                Access::NeedsAdmin | Access::Failed { .. }
+            ));
+        }
         assert!(scan.tasks_seen > 0, "{scan:?}");
         assert!(scan.folders_scanned > 0);
         assert!(scan.wake_tasks.iter().all(|t| t.path.starts_with('\\')));
-        assert_eq!(
-            read.access == Access::Ok,
-            scan.unreadable_folders.is_empty() && scan.unreadable_tasks.is_empty()
-        );
         eprintln!(
-            "tasks: {} folders, {} tasks seen, {} wake, {} unreadable folders, {} unreadable tasks, access {}",
+            "tasks: {} folders, {} tasks seen, {} wake, {} unreadable folders, {} unreadable tasks, elevated {}, access {}",
             scan.folders_scanned,
             scan.tasks_seen,
             scan.wake_tasks.len(),
             scan.unreadable_folders.len(),
             scan.unreadable_tasks.len(),
+            scan.elevated,
             read.access
         );
         for task in &scan.wake_tasks {
             eprintln!(
-                "  wake: {} enabled={} state={:?} next={:?}",
+                "  wake: {} enabled={:?} state={:?} next={:?}",
                 task.path, task.enabled, task.state, task.next_run
             );
         }

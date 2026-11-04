@@ -230,8 +230,16 @@ pub fn sample() -> Sourced<ProcessSample> {
         exited: 0,
     };
     // SAFETY: `entry` has its size set and outlives the call.
-    let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) }.is_ok();
-    while more {
+    let mut listed = unsafe { Process32FirstW(snapshot.0, &mut entry) };
+    let mut access = Access::Ok;
+    loop {
+        if let Err(e) = &listed {
+            // The end of the list is an error code too; only a different one is a failure.
+            if let Some(failure) = listing_failure(e.code().0) {
+                access = failure;
+            }
+            break;
+        }
         let pid = entry.th32ProcessID;
         if pid != 0 {
             let len = entry
@@ -289,13 +297,25 @@ pub fn sample() -> Sourced<ProcessSample> {
             }
         }
         // SAFETY: as for Process32FirstW.
-        more = unsafe { Process32NextW(snapshot.0, &mut entry) }.is_ok();
+        listed = unsafe { Process32NextW(snapshot.0, &mut entry) };
     }
+    if access != Access::Ok && sample.processes.is_empty() {
+        return Sourced::unreadable(source, access);
+    }
+    // A listing that broke off part way keeps what it had, with the failure as the access.
     Sourced {
         source,
-        access: Access::Ok,
+        access,
         data: vec![sample],
     }
+}
+
+/// ToolHelp ends a listing by failing with `ERROR_NO_MORE_FILES`, also when the snapshot is empty.
+/// That is a clean end (`None`); any other `HRESULT` is a real failure.
+#[cfg(windows)]
+fn listing_failure(hresult: i32) -> Option<Access> {
+    const ERROR_NO_MORE_FILES: i32 = 0x8007_0012u32 as i32;
+    (hresult != ERROR_NO_MORE_FILES).then(|| crate::power::access_from_hresult(hresult))
 }
 
 #[cfg(test)]
@@ -490,6 +510,23 @@ mod tests {
         let next = sample_of(1, 0, vec![proc(1, "a", -9, 1.0, 1, 0, 0)]);
         let top = top(&prev, &next, 5);
         assert!((top.by_cpu[0].cpu_percent - 100.0).abs() < 1e-9);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_a_real_failure_ends_a_listing_badly() {
+        // ERROR_NO_MORE_FILES is how ToolHelp says "that was the last one".
+        assert_eq!(listing_failure(0x8007_0012u32 as i32), None);
+        // Access denied and anything else are failures, not an empty list.
+        assert_eq!(
+            listing_failure(0x8007_0005u32 as i32),
+            Some(Access::NeedsAdmin)
+        );
+        // ERROR_BAD_LENGTH, as a wrong `dwSize` would give.
+        match listing_failure(0x8007_0018u32 as i32) {
+            Some(Access::Failed { code, .. }) => assert_eq!(code, 24),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[cfg(windows)]
