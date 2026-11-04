@@ -1,0 +1,88 @@
+name: Release
+
+# Runs on a pushed tag named v* and on nothing else. It builds, checks and packs the release (a
+# portable zip and an installer) and leaves a DRAFT GitHub release for the owner to read and
+# publish. Nothing is signed (signing is the owner's decision) and the only credential is the
+# workflow's own GITHUB_TOKEN.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build, check and package
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      # No build cache anywhere here: a release is built from the tag alone, not from what earlier
+      # runs left behind. CI has already run the tests on the commit that was tagged.
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked --version 0.5.9
+
+      # One script does it all, the same one a developer runs: it builds the three executables and
+      # the NSIS installer, runs the no-network test on the exact files it ships, then writes the zip,
+      # the installer, the SBOMs and SHA256SUMS.txt into dist/. The tag is passed through the
+      # environment, never pasted into the script text, and the script refuses a tag that is not
+      # v<workspace version>[-suffix]. Nothing is signed.
+      - name: Package (zip, installer, SBOMs, checksums)
+        env:
+          TAG: ${{ github.ref_name }}
+        run: ./scripts/package-release.ps1 -Tag $env:TAG -Out dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+
+  # A separate job: the build above runs third-party build scripts and never holds a write token.
+  publish:
+    name: draft the GitHub release
+    needs: build
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dist
+          path: dist
+
+      # --draft: nothing is public until the owner publishes it. --verify-tag: the tag must exist.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          flags=()
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag --title "$TAG" "${flags[@]}" \
+            --generate-notes \
+            --notes "Unsigned build, so Windows SmartScreen may warn about the installer. Check each file against SHA256SUMS.txt (sha256sum -c SHA256SUMS.txt, or Get-FileHash). The installer installs per machine into Program Files; the zip is portable. The SBOMs are CycloneDX 1.5."
