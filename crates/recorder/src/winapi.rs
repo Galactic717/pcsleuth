@@ -239,10 +239,14 @@ fn token_user_sid(token: HANDLE) -> io::Result<String> {
 }
 
 /// The security descriptor string for the data folder: protected (nothing inherited from
-/// `%ProgramData%`), full control for SYSTEM, Administrators and the one user, and inherited by the
-/// ring file inside.
+/// `%ProgramData%`), full control for SYSTEM and Administrators, and **read only** (`FR`, file
+/// generic read) for the one user, all inherited by the ring file inside.
+///
+/// The user can read their own history but cannot write, rename or delete anything in the folder.
+/// The service (SYSTEM) writes in this folder, so full control for an account whose unelevated
+/// processes could then replace the folder with a junction would let them steer SYSTEM's writes.
 pub fn protected_folder_sddl(user_sid: &str) -> String {
-    format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user_sid})")
+    format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;{user_sid})")
 }
 
 /// Create `dir` (one level) with the descriptor from [`protected_folder_sddl`], or, if it exists,
@@ -431,13 +435,23 @@ mod tests {
         let sid = current_user_sid().unwrap();
         create_protected_dir(&dir, &sid).unwrap();
         let sddl = dacl_sddl(&dir).unwrap();
+        // What the user can really do there: list it, but not add to it. (Unelevated, the
+        // Administrators entry does not apply to this token, so only the read entry does.)
+        let listed = std::fs::read_dir(&dir).is_ok();
+        let written = std::fs::write(dir.join("planted.txt"), b"x");
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!("DACL: {sddl}");
+        assert!(listed, "the user cannot read their own folder");
+        if !pcsleuth_sources::power::is_elevated() {
+            assert!(written.is_err(), "the user could write into the folder");
+        }
         assert!(sddl.starts_with("D:P"), "not protected: {sddl}");
         assert_eq!(sddl.matches("(A;").count(), 3, "{sddl}");
         assert!(sddl.contains("(A;OICI;FA;;;SY)"), "{sddl}");
         assert!(sddl.contains("(A;OICI;FA;;;BA)"), "{sddl}");
-        assert!(sddl.contains(&format!("(A;OICI;FA;;;{sid})")), "{sddl}");
+        // The user reads, and nothing more: no write, no delete.
+        assert!(sddl.contains(&format!("(A;OICI;FR;;;{sid})")), "{sddl}");
+        assert!(!sddl.contains(&format!("FA;;;{sid}")), "{sddl}");
     }
 
     #[test]

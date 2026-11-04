@@ -576,6 +576,14 @@ impl<S: Storage> RingWriter<S> {
     /// Store `sample` as the next one, overwriting the oldest once the ring is full.
     pub fn append(&mut self, sample: &Sample) -> io::Result<()> {
         let seq = self.header.next_seq;
+        // A damaged or hostile ring can hold the largest sequence number. Wrapping would put old
+        // samples after new ones, so refuse and let the ring be reset instead.
+        let next = seq.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the ring's sequence numbers are used up; reset the ring",
+            )
+        })?;
         let index = seq.saturating_sub(1) % u64::from(self.header.slot_count);
         let at = (index + 1) * BLOCK as u64;
         if at + BLOCK as u64 > self.header.file_bytes() {
@@ -587,7 +595,7 @@ impl<S: Storage> RingWriter<S> {
         self.file.seek(SeekFrom::Start(at))?;
         self.file.write_all(&encode_slot(seq, sample))?;
         self.bytes_written += BLOCK as u64;
-        self.header.next_seq = seq + 1;
+        self.header.next_seq = next;
         self.write_header()
     }
 
@@ -869,6 +877,27 @@ mod tests {
             scan(&mut Cursor::new(Vec::new())),
             Err(RingError::TooShort)
         ));
+    }
+
+    #[test]
+    fn the_largest_sequence_number_is_refused_not_wrapped() {
+        let mut w = ring(4);
+        // A valid, correctly placed slot numbered u64::MAX, as a damaged or hostile file could hold.
+        let index = ((u64::MAX - 1) % 4) as usize;
+        let block = encode_slot(u64::MAX, &sample(1));
+        let at = (index + 1) * BLOCK;
+        w.file.get_mut()[at..at + BLOCK].copy_from_slice(&block);
+        let now = Timestamp::from_second(T0).unwrap();
+        let mut again =
+            RingWriter::start(Cursor::new(w.file.get_ref().clone()), 0, 60, now).unwrap();
+        assert_eq!(again.header().next_seq, u64::MAX);
+        let before = again.file.get_ref().clone();
+        let err = again.append(&sample(2)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Nothing was written, and the ring still reads.
+        assert_eq!(*again.file.get_ref(), before);
+        let got = scan(&mut Cursor::new(before)).unwrap();
+        assert_eq!(seqs(&got), vec![u64::MAX]);
     }
 
     #[test]
