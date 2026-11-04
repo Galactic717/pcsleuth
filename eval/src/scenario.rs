@@ -70,10 +70,7 @@ pub enum Needs {
     /// Windows records it where an unelevated read finds it.
     Nothing,
     /// Readable only when elevated.
-    Admin {
-        limit: SourceId,
-        adds: &'static str,
-    },
+    Admin { limit: SourceId, adds: &'static str },
     /// Never recorded, elevated or not.
     Never {
         reason: &'static str,
@@ -285,7 +282,9 @@ mod tests {
 
     #[test]
     fn every_fault_has_an_injector_source_file_named_after_its_exe() {
-        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("bin");
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("bin");
         for fault in Fault::ALL {
             assert!(fault.exe().starts_with(EXE_PREFIX), "{}", fault.exe());
             assert!(
@@ -302,15 +301,16 @@ mod tests {
     fn exe_names_are_distinct_and_normalize_to_the_expected_cause() {
         let exes: BTreeSet<_> = Fault::ALL.iter().map(|f| f.exe()).collect();
         assert_eq!(exes.len(), Fault::ALL.len());
-        assert_eq!(
-            Fault::Cpu.cause(),
-            Cause::process("PCSLEUTH-FAULT-CPU.EXE")
-        );
+        assert_eq!(Fault::Cpu.cause(), Cause::process("PCSLEUTH-FAULT-CPU.EXE"));
     }
 
     #[test]
     fn only_the_sleep_scenarios_sleep() {
-        let sleepers: Vec<_> = SCENARIOS.iter().filter(|s| s.sleeps()).map(|s| s.name).collect();
+        let sleepers: Vec<_> = SCENARIOS
+            .iter()
+            .filter(|s| s.sleeps())
+            .map(|s| s.name)
+            .collect();
         assert_eq!(sleepers, ["sleep-timer-wake", "sleep-hibernate-timer-wake"]);
     }
 
@@ -324,15 +324,26 @@ mod tests {
         assert_eq!(needs.observable(true), Observable::Yes);
         assert_eq!(Needs::Nothing.observable(false), Observable::Yes);
         assert!(matches!(
-            Needs::Never { reason: "r", limit: None }.observable(true),
+            Needs::Never {
+                reason: "r",
+                limit: None
+            }
+            .observable(true),
             Observable::No { .. }
         ));
     }
 
     #[test]
     fn there_are_both_kinds_of_scenario() {
-        let unelevated: Vec<_> = SCENARIOS.iter().map(|s| s.needs.observable(false)).collect();
-        assert!(unelevated.iter().any(|o| *o == Observable::Yes));
-        assert!(unelevated.iter().any(|o| matches!(o, Observable::No { .. })));
+        let unelevated: Vec<_> = SCENARIOS
+            .iter()
+            .map(|s| s.needs.observable(false))
+            .collect();
+        assert!(unelevated.contains(&Observable::Yes));
+        assert!(
+            unelevated
+                .iter()
+                .any(|o| matches!(o, Observable::No { .. }))
+        );
     }
 }

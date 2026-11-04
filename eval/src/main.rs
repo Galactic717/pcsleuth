@@ -11,7 +11,10 @@ use pcsleuth_eval::runner::{self, Options};
 use pcsleuth_eval::scenario::SCENARIOS;
 
 #[derive(Debug, Parser)]
-#[command(name = "pcsleuth-eval", about = "Fault injection and scoring for pcsleuth")]
+#[command(
+    name = "pcsleuth-eval",
+    about = "Fault injection and scoring for pcsleuth"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -77,7 +80,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     )
                 };
                 let sleeps = if s.sleeps() { " [needs --sleep]" } else { "" };
-                println!("{} ({}){sleeps}\n    {}\n    observable: {observable}", s.name, s.question, s.summary);
+                println!(
+                    "{} ({}){sleeps}\n    {}\n    observable: {observable}",
+                    s.name, s.question, s.summary
+                );
             }
             Ok(ExitCode::SUCCESS)
         }

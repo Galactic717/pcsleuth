@@ -35,7 +35,11 @@ fn the_safe_injectors_say_ready_and_exit_by_themselves() {
         injected.wait_ready().unwrap();
         let status = injected.wait_exit(Duration::from_secs(15)).unwrap();
         assert!(status.success(), "{}: {status}", fault.exe());
-        assert!(started.elapsed() < Duration::from_secs(15), "{}", fault.exe());
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{}",
+            fault.exe()
+        );
     }
 }
 
@@ -44,7 +48,12 @@ fn the_wake_timer_injector_arms_or_says_why_it_cannot() {
     let job = Job::new().unwrap();
     let mut injected = spawn(&job, TIMER, Fault::WakeTimer, &["--secs", "1"]).unwrap();
     match injected.wait_ready() {
-        Ok(()) => assert!(injected.wait_exit(Duration::from_secs(15)).unwrap().success()),
+        Ok(()) => assert!(
+            injected
+                .wait_exit(Duration::from_secs(15))
+                .unwrap()
+                .success()
+        ),
         // A VM or a PC without resume timers: the injector must say so, not crash.
         Err(error) => assert!(error.to_string().contains("reported error:"), "{error:#}"),
     }
@@ -57,7 +66,12 @@ fn the_disk_hog_deletes_its_scratch_directory() {
     injected.wait_ready().unwrap();
     let dir = disk_dir(injected.pid());
     assert!(dir.is_dir(), "the scratch directory exists while it runs");
-    assert!(injected.wait_exit(Duration::from_secs(20)).unwrap().success());
+    assert!(
+        injected
+            .wait_exit(Duration::from_secs(20))
+            .unwrap()
+            .success()
+    );
     assert!(!dir.exists(), "{} was not deleted", dir.display());
 }
 
@@ -85,7 +99,10 @@ fn dropping_an_injector_kills_it_and_cleans_up() {
     let dir = disk_dir(injected.pid());
     let started = Instant::now();
     drop(injected);
-    assert!(started.elapsed() < Duration::from_secs(10), "drop waited for the time bound");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "drop waited for the time bound"
+    );
     assert!(!dir.exists(), "{} was left behind", dir.display());
 }
 
@@ -103,7 +120,11 @@ fn a_panic_in_a_scenario_still_cleans_up() {
     assert!(result.is_err());
     assert!(started.elapsed() < Duration::from_secs(20));
     let dir = dir.expect("the injector started");
-    assert!(!dir.exists(), "{} was left behind after a panic", dir.display());
+    assert!(
+        !dir.exists(),
+        "{} was left behind after a panic",
+        dir.display()
+    );
 }
 
 #[test]

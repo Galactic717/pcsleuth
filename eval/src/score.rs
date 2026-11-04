@@ -132,7 +132,12 @@ pub struct Scored {
 /// 4. With nothing named, the result depends on whether the cause was observable.
 pub fn score(expect: &Expect, observable: &Observable, answer: Option<&Answer>) -> Scored {
     let Some(answer) = answer else {
-        return unnamed(observable, None, false, "the tool produced no usable answer");
+        return unnamed(
+            observable,
+            None,
+            false,
+            "the tool produced no usable answer",
+        );
     };
     let placeholder = !answer.findings.is_empty()
         && answer
@@ -200,9 +205,10 @@ fn unnamed(
     let (outcome, detail) = match observable {
         Observable::Yes => (Outcome::Miss, format!("observable, but {why}")),
         Observable::No { limit, .. } => match answer {
-            Some(answer) if admits_gap(answer, *limit) => {
-                (Outcome::Honest, "not observable, and the answer says so".to_owned())
-            }
+            Some(answer) if admits_gap(answer, *limit) => (
+                Outcome::Honest,
+                "not observable, and the answer says so".to_owned(),
+            ),
             _ => (
                 Outcome::Silent,
                 format!("not observable, but the answer did not admit a gap ({why})"),
@@ -275,7 +281,7 @@ fn injected(expect: &Expect) -> String {
 
 #[cfg(test)]
 mod tests {
-    use pcsleuth_core::{Finding, Limit, NotRecorded, Question, Access};
+    use pcsleuth_core::{Access, Finding, Limit, NotRecorded, Question};
 
     use super::*;
 
@@ -386,7 +392,10 @@ mod tests {
     fn the_right_process_on_an_older_record_never_matches() {
         // The same exe crashed in an earlier run. Naming it is not naming this crash.
         let stale = answer(
-            vec![recorded("r", vec![crash_ev("pcsleuth-fault-crash.exe", "7")])],
+            vec![recorded(
+                "r",
+                vec![crash_ev("pcsleuth-fault-crash.exe", "7")],
+            )],
             vec![],
         );
         let scored = score(&expect(&["42"]), &Observable::Yes, Some(&stale));
@@ -453,14 +462,8 @@ mod tests {
     #[test]
     fn correlated_and_sampled_findings_count_as_confident() {
         for build in [Finding::correlated, Finding::sampled] {
-            let finding = build(
-                "r",
-                Question::Slow,
-                "h",
-                "x",
-                [crash_ev("chrome.exe", "1")],
-            )
-            .unwrap();
+            let finding =
+                build("r", Question::Slow, "h", "x", [crash_ev("chrome.exe", "1")]).unwrap();
             let a = answer(vec![finding], vec![]);
             assert_eq!(
                 outcome(&expect(&[]), &Observable::Yes, &a),
@@ -519,7 +522,10 @@ mod tests {
     #[test]
     fn not_recorded_when_observable_is_a_miss() {
         let a = answer(vec![unknown("n")], vec![]);
-        assert_eq!(outcome(&expect(&["42"]), &Observable::Yes, &a), Outcome::Miss);
+        assert_eq!(
+            outcome(&expect(&["42"]), &Observable::Yes, &a),
+            Outcome::Miss
+        );
         let empty = answer(vec![], vec![]);
         assert_eq!(
             outcome(&expect(&["42"]), &Observable::Yes, &empty),
@@ -540,7 +546,10 @@ mod tests {
             )],
             vec![],
         );
-        assert_eq!(outcome(&expect(&["42"]), &Observable::Yes, &a), Outcome::Miss);
+        assert_eq!(
+            outcome(&expect(&["42"]), &Observable::Yes, &a),
+            Outcome::Miss
+        );
     }
 
     #[test]
@@ -601,17 +610,29 @@ mod tests {
         let limit = |source| Limit::new(source, Access::NeedsAdmin).unwrap();
         let relevant = answer(vec![], vec![limit(SourceId::PowerRequests)]);
         let unrelated = answer(vec![], vec![limit(SourceId::Srum)]);
-        assert_eq!(outcome(&expect(&[]), &observable, &relevant), Outcome::Honest);
-        assert_eq!(outcome(&expect(&[]), &observable, &unrelated), Outcome::Silent);
+        assert_eq!(
+            outcome(&expect(&[]), &observable, &relevant),
+            Outcome::Honest
+        );
+        assert_eq!(
+            outcome(&expect(&[]), &observable, &unrelated),
+            Outcome::Silent
+        );
     }
 
     #[test]
     fn naming_the_process_when_not_observable_is_still_judged_by_the_name() {
         let right = answer(
-            vec![recorded("r", vec![crash_ev("pcsleuth-fault-crash.exe", "1")])],
+            vec![recorded(
+                "r",
+                vec![crash_ev("pcsleuth-fault-crash.exe", "1")],
+            )],
             vec![],
         );
-        let wrong = answer(vec![recorded("r", vec![crash_ev("chrome.exe", "1")])], vec![]);
+        let wrong = answer(
+            vec![recorded("r", vec![crash_ev("chrome.exe", "1")])],
+            vec![],
+        );
         assert_eq!(
             outcome(&expect(&[]), &not_observable(), &right),
             Outcome::TruePositive
@@ -630,7 +651,10 @@ mod tests {
             outcome(&expect(&[]), &unverified, &unknown_answer),
             Outcome::Unverified
         );
-        let wrong = answer(vec![recorded("r", vec![crash_ev("chrome.exe", "1")])], vec![]);
+        let wrong = answer(
+            vec![recorded("r", vec![crash_ev("chrome.exe", "1")])],
+            vec![],
+        );
         assert_eq!(
             outcome(&expect(&[]), &unverified, &wrong),
             Outcome::FalseAttribution
@@ -681,7 +705,10 @@ mod tests {
         let scored = score(&expect(&["42"]), &Observable::Yes, Some(&a));
         assert_eq!(scored.outcome, Outcome::TruePositive);
         assert_eq!(scored.extras, 2);
-        assert_eq!(scored.named, vec!["chrome".to_string(), "teams".to_string()]);
+        assert_eq!(
+            scored.named,
+            vec!["chrome".to_string(), "teams".to_string()]
+        );
     }
 
     #[test]

@@ -214,7 +214,11 @@ pub struct Results<'a> {
 
 /// The file name for a run: sortable, and says where it ran.
 pub fn file_name(env: &Env) -> String {
-    format!("run-{}-{}.json", env.date.strftime("%Y%m%dT%H%M%SZ"), env.tag)
+    format!(
+        "run-{}-{}.json",
+        env.date.strftime("%Y%m%dT%H%M%SZ"),
+        env.tag
+    )
 }
 
 #[cfg(test)]
@@ -238,13 +242,54 @@ mod tests {
             limit: None,
         };
         vec![
-            Row::scored("a", Question::Crash, &Observable::Yes, scored(Outcome::TruePositive, false), vec!["1".into()]),
-            Row::scored("b", Question::Now, &Observable::Yes, scored(Outcome::Miss, true), vec![]),
-            Row::scored("c", Question::Slow, &no, scored(Outcome::Honest, true), vec![]),
-            Row::scored("d", Question::Slow, &no, scored(Outcome::Silent, false), vec![]),
-            Row::scored("e", Question::Wake, &Observable::Yes, scored(Outcome::FalseAttribution, false), vec![]),
-            Row::scored("f", Question::Wake, &Observable::Unverified("w".into()), scored(Outcome::Unverified, false), vec![]),
-            Row::not_run("g", Question::Wake, &Observable::Yes, "needs --sleep".into()),
+            Row::scored(
+                "a",
+                Question::Crash,
+                &Observable::Yes,
+                scored(Outcome::TruePositive, false),
+                vec!["1".into()],
+            ),
+            Row::scored(
+                "b",
+                Question::Now,
+                &Observable::Yes,
+                scored(Outcome::Miss, true),
+                vec![],
+            ),
+            Row::scored(
+                "c",
+                Question::Slow,
+                &no,
+                scored(Outcome::Honest, true),
+                vec![],
+            ),
+            Row::scored(
+                "d",
+                Question::Slow,
+                &no,
+                scored(Outcome::Silent, false),
+                vec![],
+            ),
+            Row::scored(
+                "e",
+                Question::Wake,
+                &Observable::Yes,
+                scored(Outcome::FalseAttribution, false),
+                vec![],
+            ),
+            Row::scored(
+                "f",
+                Question::Wake,
+                &Observable::Unverified("w".into()),
+                scored(Outcome::Unverified, false),
+                vec![],
+            ),
+            Row::not_run(
+                "g",
+                Question::Wake,
+                &Observable::Yes,
+                "needs --sleep".into(),
+            ),
         ]
     }
 
@@ -252,7 +297,13 @@ mod tests {
     fn summary_counts_every_outcome_and_never_counts_not_run_as_a_pass() {
         let s = Summary::of(&rows());
         assert_eq!(
-            (s.true_positive, s.honest, s.miss, s.silent, s.false_attribution),
+            (
+                s.true_positive,
+                s.honest,
+                s.miss,
+                s.silent,
+                s.false_attribution
+            ),
             (1, 1, 1, 1, 1)
         );
         assert_eq!((s.unverified, s.not_run), (1, 1));
@@ -268,7 +319,12 @@ mod tests {
 
     #[test]
     fn a_run_where_nothing_ran_scores_nothing() {
-        let rows = vec![Row::not_run("g", Question::Wake, &Observable::Yes, "x".into())];
+        let rows = vec![Row::not_run(
+            "g",
+            Question::Wake,
+            &Observable::Yes,
+            "x".into(),
+        )];
         let s = Summary::of(&rows);
         assert_eq!((s.points, s.possible, s.not_run), (0, 0, 1));
         assert_eq!(Summary::of(&[]), Summary::default());
@@ -278,7 +334,10 @@ mod tests {
     fn the_table_lists_every_row_and_says_not_run_is_not_a_pass() {
         let text = table(&rows());
         for name in ["a", "b", "c", "d", "e", "f", "g"] {
-            assert!(text.lines().any(|l| l.starts_with(&format!("{name} "))), "{name}");
+            assert!(
+                text.lines().any(|l| l.starts_with(&format!("{name} "))),
+                "{name}"
+            );
         }
         assert!(text.contains("not_run"));
         assert!(text.contains("never a pass"));
@@ -292,7 +351,13 @@ mod tests {
             limit: None,
         };
         let row = |placeholder| {
-            Row::scored("c", Question::Slow, &no, scored(Outcome::Honest, placeholder), vec![])
+            Row::scored(
+                "c",
+                Question::Slow,
+                &no,
+                scored(Outcome::Honest, placeholder),
+                vec![],
+            )
         };
         assert_eq!(Summary::of(&[row(false)]).points, 1);
         assert_eq!(Summary::of(&[row(true)]).points, 0);
@@ -340,6 +405,10 @@ mod tests {
         assert_eq!(json["scenarios"][6]["status"], "not_run");
         assert!(json["scenarios"][6]["outcome"].is_null());
         let keys: Vec<_> = json["env"].as_object().unwrap().keys().cloned().collect();
-        assert!(!keys.iter().any(|k| k.contains("host") || k.contains("user") || k.contains("name")));
+        assert!(
+            !keys
+                .iter()
+                .any(|k| k.contains("host") || k.contains("user") || k.contains("name"))
+        );
     }
 }

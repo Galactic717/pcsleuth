@@ -201,7 +201,10 @@ mod tests {
         assert_eq!(events[0].record_id, "170177");
         assert_eq!(events[0].app, "RedactedApp.exe");
         assert_eq!(events[0].pid, 0x6838);
-        assert_eq!(events[0].time, "2026-11-01T16:34:36.9392248Z".parse().unwrap());
+        assert_eq!(
+            events[0].time,
+            "2026-11-01T16:34:36.9392248Z".parse().unwrap()
+        );
         assert_eq!(events[3].pid, 0x13f8);
     }
 
@@ -241,8 +244,17 @@ mod tests {
 
     #[test]
     fn garbage_yields_no_events_and_does_not_panic() {
-        for xml in ["", "<Event ", "<Event <Event >", "not xml at all", "<Event x></Event>"] {
-            assert!(parse_app_events(xml, "Application Error").is_empty(), "{xml:?}");
+        for xml in [
+            "",
+            "<Event ",
+            "<Event <Event >",
+            "not xml at all",
+            "<Event x></Event>",
+        ] {
+            assert!(
+                parse_app_events(xml, "Application Error").is_empty(),
+                "{xml:?}"
+            );
         }
     }
 
@@ -265,7 +277,10 @@ mod tests {
             ("WORKBOX".to_owned(), "<host>"),
         ];
         assert_eq!(
-            scrub(r"cannot open c:\users\alex!\x on workbox as ALEX!", &secrets),
+            scrub(
+                r"cannot open c:\users\alex!\x on workbox as ALEX!",
+                &secrets
+            ),
             r"cannot open <home>\x on <host> as <user>"
         );
         assert_eq!(scrub("nothing here", &secrets), "nothing here");

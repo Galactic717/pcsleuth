@@ -119,7 +119,10 @@ fn nap(total: Duration) -> Result<()> {
         if sys::interrupted() {
             bail!("interrupted");
         }
-        std::thread::sleep(end.saturating_duration_since(Instant::now()).min(Duration::from_millis(50)));
+        std::thread::sleep(
+            end.saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50)),
+        );
     }
     Ok(())
 }
@@ -143,7 +146,11 @@ impl Injected {
             .with_context(|| format!("could not start {}", fault.exe()))?;
         let stdout = child.stdout.take().context("the injector has no stdout")?;
         let (sender, lines) = mpsc::channel();
-        let injected = Injected { child, lines, fault };
+        let injected = Injected {
+            child,
+            lines,
+            fault,
+        };
         job.assign(&injected.child)
             .with_context(|| format!("could not place {} in the job object", fault.exe()))?;
         std::thread::spawn(move || {
@@ -175,7 +182,11 @@ impl Injected {
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => {
                     if Instant::now() >= end {
-                        bail!("{} was not ready after {} s", self.fault.exe(), READY_TIMEOUT.as_secs());
+                        bail!(
+                            "{} was not ready after {} s",
+                            self.fault.exe(),
+                            READY_TIMEOUT.as_secs()
+                        );
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
@@ -196,7 +207,11 @@ impl Injected {
                 bail!("interrupted");
             }
             if Instant::now() >= end {
-                bail!("{} did not exit within {} s", self.fault.exe(), timeout.as_secs());
+                bail!(
+                    "{} did not exit within {} s",
+                    self.fault.exe(),
+                    timeout.as_secs()
+                );
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -282,26 +297,34 @@ impl Ctx<'_> {
     }
 
     /// Inject, ask, score. An `Err` means the scenario could not run: it is reported as not run.
-    fn execute(&self, scenario: &Scenario, observable: &Observable) -> Result<(Scored, Vec<String>)> {
+    fn execute(
+        &self,
+        scenario: &Scenario,
+        observable: &Observable,
+    ) -> Result<(Scored, Vec<String>)> {
         // Two seconds of slack for the clocks of the harness and of the event log.
         let since = Timestamp::from_second(Timestamp::now().as_second() - 2)?;
         let fault = scenario.fault();
         let mut record_ids = Vec::new();
-        let _held;
-        match scenario.inject {
-            Inject::Live { secs, settle_secs, .. } => {
+        // Kept alive until the question is answered, then dropped: that kills and cleans up.
+        let _held = match scenario.inject {
+            Inject::Live {
+                secs, settle_secs, ..
+            } => {
                 let mut injected = self.spawn(fault, &["--secs", &secs.to_string()])?;
                 injected.wait_ready()?;
                 nap(Duration::from_secs(settle_secs))?;
-                _held = injected;
+                injected
             }
             Inject::Past { secs, .. } => {
                 let mut injected = self.spawn(fault, &["--secs", &secs.to_string()])?;
                 injected.wait_ready()?;
                 injected.wait_exit(Duration::from_secs(secs + 20))?;
-                _held = injected;
+                injected
             }
-            Inject::Event { provider, event_id, .. } => {
+            Inject::Event {
+                provider, event_id, ..
+            } => {
                 let mut injected = self.spawn(fault, &[])?;
                 injected.wait_ready()?;
                 let exe = format!("{}.exe", fault.exe());
@@ -314,12 +337,10 @@ impl Ctx<'_> {
                             )
                         })?;
                 record_ids.push(event.record_id);
-                _held = injected;
+                injected
             }
-            Inject::Sleep { hibernate, .. } => {
-                _held = self.sleep_and_wake(fault, hibernate)?;
-            }
-        }
+            Inject::Sleep { hibernate, .. } => self.sleep_and_wake(fault, hibernate)?,
+        };
         let answer = ask(self.job, self.tool, scenario.question, since);
         let expect = Expect {
             cause: fault.cause(),
@@ -418,7 +439,8 @@ pub fn run(opts: Options) -> Result<ExitCode> {
     for scenario in selected {
         note(&format!("running {} ...", scenario.name));
         let observable = scenario.needs.observable(ctx.env.elevated);
-        let not_run = |reason: String| Row::not_run(scenario.name, scenario.question, &observable, reason);
+        let not_run =
+            |reason: String| Row::not_run(scenario.name, scenario.question, &observable, reason);
         let mut row = if sys::interrupted() {
             not_run("interrupted".to_owned())
         } else if let (true, Some(why)) = (scenario.sleeps(), sleep_block) {
@@ -435,7 +457,11 @@ pub fn run(opts: Options) -> Result<ExitCode> {
         // Free text can carry a path or a name from an OS error. Nothing personal may reach disk.
         row.detail = host::scrub(&row.detail, &secrets);
         row.why = row.why.map(|why| host::scrub(&why, &secrets));
-        row.named = row.named.iter().map(|name| host::scrub(name, &secrets)).collect();
+        row.named = row
+            .named
+            .iter()
+            .map(|name| host::scrub(name, &secrets))
+            .collect();
         rows.push(row);
     }
 
@@ -471,7 +497,14 @@ mod tests {
         assert!(sleep_allowed(true, "sleep this pc"));
         assert!(sleep_allowed(true, "  Sleep This PC \r\n"));
         assert!(!sleep_allowed(false, "sleep this pc"));
-        for typed in ["", "yes", "y", "sleep", "sleep this pc now", "sleep this pc please"] {
+        for typed in [
+            "",
+            "yes",
+            "y",
+            "sleep",
+            "sleep this pc now",
+            "sleep this pc please",
+        ] {
             assert!(!sleep_allowed(true, typed), "{typed:?}");
         }
     }
@@ -483,7 +516,10 @@ mod tests {
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].name, "cpu-hog-live");
         let error = select(&["nope".to_owned()]).unwrap_err().to_string();
-        assert!(error.contains("nope") && error.contains("crash-app-error"), "{error}");
+        assert!(
+            error.contains("nope") && error.contains("crash-app-error"),
+            "{error}"
+        );
     }
 
     #[test]

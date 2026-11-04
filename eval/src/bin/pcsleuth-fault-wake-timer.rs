@@ -8,8 +8,12 @@
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
     use pcsleuth_eval::fault;
-    use windows::Win32::Foundation::{CloseHandle, ERROR_NOT_SUPPORTED, GetLastError, SetLastError, WIN32_ERROR};
-    use windows::Win32::System::Threading::{CancelWaitableTimer, CreateWaitableTimerW, SetWaitableTimer};
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_NOT_SUPPORTED, GetLastError, SetLastError, WIN32_ERROR,
+    };
+    use windows::Win32::System::Threading::{
+        CancelWaitableTimer, CreateWaitableTimerW, SetWaitableTimer,
+    };
 
     const WEEK: u64 = 7 * 24 * 3600;
     const TICKS_PER_SEC: i64 = 10_000_000;
