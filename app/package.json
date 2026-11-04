@@ -1,0 +1,24 @@
+{
+  "name": "pcsleuth-app",
+  "private": true,
+  "version": "0.1.0",
+  "description": "The pcsleuth desktop app: a timeline of answers, each opening its evidence.",
+  "license": "Apache-2.0",
+  "author": "Galactic717",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.4"
+  },
+  "devDependencies": {
+    "jsdom": "30.1.3",
+    "typescript": "7.0.2",
+    "vite": "8.3.5",
+    "vitest": "5.1.0"
+  }
+}

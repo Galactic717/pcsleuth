@@ -1,0 +1,25 @@
+[package]
+name = "pcsleuth-app"
+description = "The pcsleuth desktop app: a timeline of answers, each opening its evidence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "pcsleuth-app"
+path = "src/main.rs"
+
+# Tauri is declared here, not in the workspace table, because only the app uses it (docs/PLAN.md).
+# Both are pinned to a 2.x release (ADR 0005). The crates.io default is the 3.0 alpha.
+[build-dependencies]
+tauri-build = { version = "=2.7.4", features = [] }
+
+[dependencies]
+pcsleuth-core.workspace = true
+pcsleuth-engine.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "=2.12.5", features = [] }
