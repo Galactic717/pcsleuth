@@ -90,6 +90,7 @@ impl SourceId {
             SourceId::PowerRequests => Some("live power requests with their owners"),
             SourceId::WakeTimers => Some("live wake timers"),
             SourceId::Srum => Some("per-app energy, IO and network use"),
+            SourceId::ScheduledTasks => Some("scheduled tasks hidden from this user"),
             SourceId::EventLogSystem
             | SourceId::EventLogApplication
             | SourceId::EventLogResourceExhaustion
@@ -97,7 +98,6 @@ impl SourceId {
             | SourceId::PowerState
             | SourceId::ArmedDevices
             | SourceId::BatteryReport
-            | SourceId::ScheduledTasks
             | SourceId::Processes
             | SourceId::Recorder => None,
         }
@@ -122,6 +122,9 @@ pub enum Access {
     LogDisabled,
     /// The log, file or feature does not exist on this machine.
     Missing,
+    /// Read, but not all of it: records were unreadable or a limit was hit. `data` holds what was
+    /// read, and `message` says what is missing.
+    Partial { message: String },
     /// Anything else. `code` is the Win32 error or HRESULT, `message` is opaque text for display.
     Failed { code: u32, message: String },
 }
@@ -145,6 +148,7 @@ impl fmt::Display for Access {
             Access::NeedsAdmin => f.write_str("needs admin"),
             Access::LogDisabled => f.write_str("log disabled"),
             Access::Missing => f.write_str("missing"),
+            Access::Partial { message } => write!(f, "partial: {message}"),
             Access::Failed { code, message } => write!(f, "failed (0x{code:08x}): {message}"),
         }
     }
