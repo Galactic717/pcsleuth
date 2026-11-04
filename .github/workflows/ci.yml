@@ -53,9 +53,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      # Includes the no-network test (rule 2) and the fixture redaction check.
+      # Includes the no-network test (rule 2) and the fixture redaction check. --no-fail-fast runs every
+      # crate, so one red crate does not hide the others.
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --no-fail-fast --locked
 
       # The page: npm ci installs exactly what package-lock.json pins.
       - name: App, install
