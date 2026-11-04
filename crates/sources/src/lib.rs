@@ -8,5 +8,6 @@
 pub mod battery;
 pub mod eventlog;
 pub mod power;
+pub mod processes;
 pub mod srum;
 pub mod tasks;
