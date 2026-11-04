@@ -4,10 +4,10 @@
 //! Each `unsafe` block says why it is sound. Nothing here changes a system setting, asks Windows to
 //! stay awake or changes the timer resolution.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::path::{Component, Path, PathBuf};
 
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, FILETIME, HANDLE, HLOCAL, LocalFree, WIN32_ERROR,
@@ -23,6 +23,7 @@ use windows::Win32::Security::{
     TOKEN_USER, TokenUser,
 };
 use windows::Win32::Storage::FileSystem::CreateDirectoryW;
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler,
 };
@@ -30,6 +31,9 @@ use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, GetProcessIoCounters, GetProcessTimes, GetThreadTimes,
     IO_COUNTERS, OpenProcessToken, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+};
+use windows::Win32::UI::Shell::{
+    FOLDERID_ProgramData, FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
 };
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
@@ -42,6 +46,56 @@ pub fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
 
 fn to_io(e: windows::core::Error) -> io::Error {
     io::Error::other(e)
+}
+
+/// A Windows known folder such as `C:\Program Files`, from the shell and not from an environment
+/// variable, which the user who runs us can set to anything.
+fn known_folder(id: &windows::core::GUID) -> io::Result<PathBuf> {
+    // SAFETY: `id` is a valid GUID; on success Windows returns a nul-terminated string that is
+    // freed with CoTaskMemFree below, once.
+    let path = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }.map_err(to_io)?;
+    // SAFETY: `path` is a valid nul-terminated string from the call above.
+    let folder = PathBuf::from(OsString::from_wide(unsafe { path.as_wide() }));
+    // SAFETY: allocated by SHGetKnownFolderPath, freed exactly once.
+    unsafe { CoTaskMemFree(Some(path.0.cast_const().cast())) };
+    Ok(folder)
+}
+
+/// `C:\Program Files` (the native one), where only administrators can create or change files.
+pub fn program_files_dir() -> io::Result<PathBuf> {
+    known_folder(&FOLDERID_ProgramFiles)
+}
+
+/// `C:\ProgramData`.
+pub fn program_data_dir() -> io::Result<PathBuf> {
+    known_folder(&FOLDERID_ProgramData)
+}
+
+/// True if `path` lies strictly inside `root`, comparing whole components without regard to case.
+/// A path with `.` or `..` in it is never inside anything: resolve it first with `canonicalize`.
+pub fn path_is_under(path: &Path, root: &Path) -> bool {
+    fn parts(p: &Path) -> Option<Vec<String>> {
+        p.components()
+            .map(|c| match c {
+                Component::ParentDir | Component::CurDir => None,
+                other => Some(other.as_os_str().to_string_lossy().to_lowercase()),
+            })
+            .collect()
+    }
+    match (parts(path), parts(root)) {
+        (Some(p), Some(r)) => !r.is_empty() && p.len() > r.len() && p[..r.len()] == r[..],
+        _ => false,
+    }
+}
+
+/// `\\?\C:\x` as `C:\x`. `canonicalize` returns the first form, which the service manager does
+/// not take as a program path. A `\\?\UNC\` path is left alone.
+pub fn strip_verbatim(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Run the calling thread in background mode: lowest CPU, IO and memory priority, for as long as
@@ -292,6 +346,66 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[test]
+    fn a_path_is_under_a_folder_by_whole_components_ignoring_case() {
+        let root = Path::new(r"C:\Program Files");
+        assert!(path_is_under(
+            Path::new(r"C:\Program Files\pcsleuth\r.exe"),
+            root
+        ));
+        assert!(path_is_under(Path::new(r"c:\PROGRAM FILES\x\r.exe"), root));
+        // A sibling that merely starts with the same letters is not inside.
+        assert!(!path_is_under(
+            Path::new(r"C:\Program Files (x86)\x\r.exe"),
+            root
+        ));
+        assert!(!path_is_under(
+            Path::new(r"C:\Program FilesEvil\r.exe"),
+            root
+        ));
+        assert!(!path_is_under(
+            Path::new(r"C:\Users\me\Downloads\r.exe"),
+            root
+        ));
+        assert!(!path_is_under(Path::new(r"D:\Program Files\r.exe"), root));
+        // The folder itself is not inside itself, and an empty root contains nothing.
+        assert!(!path_is_under(root, root));
+        assert!(!path_is_under(Path::new(r"C:\x"), Path::new("")));
+        // `..` is never trusted; resolve it first.
+        assert!(!path_is_under(
+            Path::new(r"C:\Program Files\..\Users\me\r.exe"),
+            root
+        ));
+        // Both in the form `canonicalize` gives.
+        assert!(path_is_under(
+            Path::new(r"\\?\C:\Program Files\pcsleuth\r.exe"),
+            Path::new(r"\\?\C:\Program Files")
+        ));
+    }
+
+    #[test]
+    fn the_verbatim_prefix_comes_off_drive_paths_only() {
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\C:\Program Files\r.exe")),
+            PathBuf::from(r"C:\Program Files\r.exe")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\UNC\server\share\r.exe")),
+            PathBuf::from(r"\\?\UNC\server\share\r.exe")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new(r"C:\plain\r.exe")),
+            PathBuf::from(r"C:\plain\r.exe")
+        );
+    }
+
+    #[test]
+    fn the_known_folders_exist() {
+        let program_files = program_files_dir().unwrap();
+        assert!(program_files.is_dir(), "{program_files:?}");
+        assert!(program_data_dir().unwrap().is_dir());
+    }
 
     #[test]
     fn this_process_has_a_sid_and_a_working_set() {

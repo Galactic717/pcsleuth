@@ -58,6 +58,31 @@ impl Drop for Cleanup {
     }
 }
 
+/// A copy of the recorder in a new folder under Program Files, the only kind of place `install`
+/// accepts. Removed on drop; declare it before [`Cleanup`] so the service is gone first.
+struct ProgramFilesCopy {
+    dir: std::path::PathBuf,
+    exe: std::path::PathBuf,
+}
+
+impl ProgramFilesCopy {
+    fn new() -> ProgramFilesCopy {
+        let dir = winapi::program_files_dir()
+            .unwrap()
+            .join(format!("pcsleuth-recorder-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("pcsleuth-recorder.exe");
+        std::fs::copy(BIN, &exe).unwrap();
+        ProgramFilesCopy { dir, exe }
+    }
+}
+
+impl Drop for ProgramFilesCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 #[test]
 #[ignore = "needs an elevated prompt; installs and removes a real service"]
 fn elevated_a_tick_sees_power_requests() {
@@ -86,11 +111,19 @@ fn elevated_a_tick_sees_power_requests() {
 #[ignore = "needs an elevated prompt; installs and removes a real service"]
 fn elevated_install_start_record_stop_uninstall() {
     require_elevation();
+    let copy = ProgramFilesCopy::new();
     let _cleanup = Cleanup;
     // Start from nothing: a leftover from an earlier run is removed first.
     let _ = service::uninstall();
 
-    let install = Command::new(BIN)
+    // Elevated, but run from the build folder, which any program of the user can write: refused
+    // with exit code 6 and nothing created.
+    let outside = Command::new(BIN).arg("install").output().unwrap();
+    assert_eq!(outside.status.code(), Some(6), "{outside:?}");
+    assert!(String::from_utf8_lossy(&outside.stderr).contains("Program Files"));
+    assert_eq!(sc(&["query", SERVICE_NAME]).0, 1060);
+
+    let install = Command::new(&copy.exe)
         .args(["install", "--interval", "2"])
         .output()
         .unwrap();
@@ -116,7 +149,7 @@ fn elevated_install_start_record_stop_uninstall() {
     assert_eq!(sddl.matches("(A;").count(), 3, "{sddl}");
 
     // A second install is refused, not duplicated.
-    let again = Command::new(BIN).arg("install").output().unwrap();
+    let again = Command::new(&copy.exe).arg("install").output().unwrap();
     assert!(!again.status.success());
     assert!(String::from_utf8_lossy(&again.stderr).contains("already installed"));
 
@@ -179,9 +212,10 @@ fn elevated_install_start_record_stop_uninstall() {
 #[ignore = "needs an elevated prompt; installs and removes a real service"]
 fn elevated_service_started_at_boot_is_what_auto_start_asks_for() {
     require_elevation();
+    let copy = ProgramFilesCopy::new();
     let _cleanup = Cleanup;
     let _ = service::uninstall();
-    let install = Command::new(BIN)
+    let install = Command::new(&copy.exe)
         .args(["install", "--auto-start"])
         .output()
         .unwrap();

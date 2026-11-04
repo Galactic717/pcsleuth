@@ -65,6 +65,14 @@ pub enum ServiceError {
          terminal use --foreground"
     )]
     NotStartedByScm,
+    #[error(
+        "refusing to install from {exe}.\n\
+         The service runs as SYSTEM, so its program file must be somewhere only administrators can \
+         change, or any program running as you could overwrite it and be started as SYSTEM.\n\
+         Copy pcsleuth-recorder.exe into a folder under {program_files} (for example \
+         {program_files}\\pcsleuth\\) from an elevated prompt, then run install from that copy."
+    )]
+    UnsafeLocation { exe: String, program_files: String },
     #[error("{what}: {source}")]
     Os {
         what: &'static str,
@@ -109,6 +117,34 @@ pub fn service_command_line(exe: &Path, interval_secs: u32) -> String {
     )
 }
 
+/// The executable's real path if it is inside `C:\Program Files` (found with the shell's known
+/// folder, not an environment variable), else [`ServiceError::UnsafeLocation`].
+///
+/// Both paths are resolved first, so a junction or link out of Program Files, `..`, and a change of
+/// case do not get past it. It does not look at the permissions of the folders in between: it
+/// relies on Program Files being writable only by administrators, which is Windows' default.
+pub fn check_install_location(exe: &Path) -> Result<PathBuf, ServiceError> {
+    let program_files = winapi::program_files_dir().map_err(|source| ServiceError::Os {
+        what: "could not find the Program Files folder",
+        source,
+    })?;
+    let real = |path: &Path| {
+        std::fs::canonicalize(path).map_err(|source| ServiceError::Os {
+            what: "could not resolve a path",
+            source,
+        })
+    };
+    let (exe_real, root) = (real(exe)?, real(&program_files)?);
+    if winapi::path_is_under(&exe_real, &root) {
+        Ok(winapi::strip_verbatim(&exe_real))
+    } else {
+        Err(ServiceError::UnsafeLocation {
+            exe: winapi::strip_verbatim(&exe_real).display().to_string(),
+            program_files: winapi::strip_verbatim(&root).display().to_string(),
+        })
+    }
+}
+
 /// What `install` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installed {
@@ -127,6 +163,9 @@ pub fn install(
     start: StartType,
     interval_secs: u32,
 ) -> Result<Installed, ServiceError> {
+    // Before anything is touched: a program file anyone can replace would run as SYSTEM.
+    let exe = check_install_location(exe)?;
+    let exe = exe.as_path();
     let ring = service_ring_path();
     let folder = ring
         .parent()
@@ -389,6 +428,27 @@ mod tests {
             line,
             r#""C:\Program Files\pcsleuth\pcsleuth-recorder.exe" run-service --interval 30"#
         );
+    }
+
+    #[test]
+    fn a_program_outside_program_files_is_refused_before_anything_is_touched() {
+        // This test binary lives in a build folder, which any program running as the user can write.
+        let exe = std::env::current_exe().unwrap();
+        match check_install_location(&exe) {
+            Err(ServiceError::UnsafeLocation { program_files, .. }) => {
+                assert!(program_files.to_lowercase().contains("program files"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // `install` refuses the same way, and does so before the folder or the service manager is
+        // reached, so this is safe to run without admin rights.
+        let refused = install(&exe, StartType::Manual, 60);
+        assert!(
+            matches!(refused, Err(ServiceError::UnsafeLocation { .. })),
+            "{refused:?}"
+        );
+        let message = refused.unwrap_err().to_string();
+        assert!(message.contains("Copy pcsleuth-recorder.exe"), "{message}");
     }
 
     #[test]

@@ -63,6 +63,10 @@ fn install_and_uninstall_refuse_without_elevation_and_change_nothing() {
         assert!(message.contains("administrator"), "{message}");
         assert!(message.contains("Nothing was changed"), "{message}");
         assert!(out.stdout.is_empty());
+        if command == "install" {
+            // This binary is in a build folder, which is the second reason it is refused.
+            assert!(message.contains("Program Files"), "{message}");
+        }
     }
     assert_eq!(service_query(), before);
 }

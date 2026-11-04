@@ -42,6 +42,8 @@ mod app {
 
     /// Exit code when a command needs an elevated prompt and this one is not.
     const NEEDS_ELEVATION: u8 = 5;
+    /// Exit code when `install` runs from a place other than Program Files.
+    const BAD_LOCATION: u8 = 6;
 
     #[derive(Parser)]
     #[command(
@@ -145,13 +147,22 @@ mod app {
     }
 
     fn install(auto_start: bool, interval_secs: u32) -> ExitCode {
-        if let Err(code) = require_elevation("install") {
-            return code;
-        }
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
             Err(e) => return finish(Err(format!("cannot find this executable: {e}"))),
         };
+        // Both problems are reported at once, so the user does not fix one and then meet the other.
+        let location = service::check_install_location(&exe);
+        if let (Err(e), false) = (&location, is_elevated()) {
+            eprintln!("pcsleuth-recorder: {e}\n");
+        }
+        if let Err(code) = require_elevation("install") {
+            return code;
+        }
+        if let Err(e) = location {
+            eprintln!("pcsleuth-recorder: {e}\nNothing was changed.");
+            return ExitCode::from(BAD_LOCATION);
+        }
         let start = if auto_start {
             StartType::Auto
         } else {
