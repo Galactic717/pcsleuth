@@ -76,10 +76,12 @@ function limit(raw: unknown): Limit {
 function window(raw: unknown): Window | null {
   if (!isBag(raw)) return null;
   const since = textOrNull(raw["since"]);
-  if (since === null) return null;
+  const limit = typeof raw["limit"] === "number" ? raw["limit"] : 0;
+  // A window with no readable start or no limit is not worth describing.
+  if (since === null || Number.isNaN(Date.parse(since)) || limit <= 0) return null;
   return {
     since,
-    limit: typeof raw["limit"] === "number" ? raw["limit"] : 0,
+    limit,
     sinceIsDefault: raw["since_is_default"] === true,
     limitIsDefault: raw["limit_is_default"] === true,
   };

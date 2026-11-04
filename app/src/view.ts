@@ -85,7 +85,7 @@ function fixBlock(finding: Finding, hooks: Hooks): HTMLElement | null {
   return block;
 }
 
-function body(finding: Finding, reply: Reply, now: Date, hooks: Hooks): HTMLElement {
+function body(finding: Finding, reply: Reply, hooks: Hooks): HTMLElement {
   const info = confidenceInfo(finding.confidence);
   const panel = el("div", { class: "finding-body" });
   if (finding.explanation) panel.append(el("p", { text: finding.explanation }));
@@ -125,7 +125,6 @@ function body(finding: Finding, reply: Reply, now: Date, hooks: Hooks): HTMLElem
 
   const fix = fixBlock(finding, hooks);
   if (fix !== null) panel.append(fix);
-  void now;
   return panel;
 }
 
@@ -157,7 +156,7 @@ function card(finding: Finding, reply: Reply, now: Date, hooks: Hooks, level: "h
     ],
   );
 
-  const panel = body(finding, reply, now, hooks);
+  const panel = body(finding, reply, hooks);
   panel.id = panelId;
   panel.hidden = true;
 

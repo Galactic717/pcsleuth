@@ -1,6 +1,6 @@
 // The only way this app puts text on the page. Text is always a text node or `textContent`.
-// Nothing in `src/` may use innerHTML, outerHTML, insertAdjacentHTML or document.write; a test
-// reads the sources and fails if one appears.
+// Nothing in `src/` may use an API that parses a string as markup; tests/guard.test.ts reads the
+// sources and fails if one appears.
 
 export interface Props {
   class?: string;
