@@ -2306,7 +2306,7 @@ dependencies = [
  "jiff",
  "pcsleuth-core",
  "pcsleuth-sources",
- "thiserror",
+ "thiserror 2.0.21",
  "windows",
 ]
 

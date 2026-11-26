@@ -491,6 +491,13 @@ mod tests {
     #[test]
     fn diagnostics_performance_is_gated_or_readable() {
         let perf = diagnostics_performance(None, 5);
+        if channel_status(DIAGNOSTICS_PERFORMANCE) == Access::Missing {
+            // Windows Server (the CI runner) does not register this channel. The source must
+            // then say Missing and return nothing, not invent records.
+            assert_eq!(perf.access, Access::Missing);
+            assert!(perf.data.is_empty());
+            return;
+        }
         assert!(readable_or_gated(&perf.access), "{:?}", perf.access);
         assert_eq!(perf.source, SourceId::EventLogDiagnosticsPerformance);
         if perf.access.elevation_helps() {

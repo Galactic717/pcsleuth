@@ -544,11 +544,14 @@ mod tests {
             .expect("this test process is in its own sample");
         assert!(me.working_set_bytes > 0 && me.cpu_time > 0 && me.created > 0);
         assert!(me.name.to_ascii_lowercase().ends_with(".exe"));
-        // The System process and other protected ones cannot be opened unelevated.
-        assert!(
-            s.denied > 0,
-            "expected some protected processes to be counted"
-        );
+        // The System process and other protected ones cannot be opened unelevated. An elevated
+        // token (the CI runner's) may open all of them, so the count can be zero there.
+        if !crate::power::is_elevated() {
+            assert!(
+                s.denied > 0,
+                "expected some protected processes to be counted"
+            );
+        }
         eprintln!(
             "processes: {} read, {} denied, {} exited, {} logical cpus",
             s.processes.len(),
