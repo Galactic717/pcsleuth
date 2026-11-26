@@ -539,9 +539,15 @@ mod tests {
         assert_eq!(sddl.matches("(A;").count(), 3, "{sddl}");
         assert!(sddl.contains("(A;OICI;FA;;;SY)"), "{sddl}");
         assert!(sddl.contains("(A;OICI;FA;;;BA)"), "{sddl}");
+        // SDDL writes the built-in Administrator (RID 500), the account a CI runner uses, as LA.
+        let who = if sid.ends_with("-500") {
+            "LA"
+        } else {
+            sid.as_str()
+        };
         // The user reads, and nothing more: no write, no delete.
-        assert!(sddl.contains(&format!("(A;OICI;FR;;;{sid})")), "{sddl}");
-        assert!(!sddl.contains(&format!("FA;;;{sid}")), "{sddl}");
+        assert!(sddl.contains(&format!("(A;OICI;FR;;;{who})")), "{sddl}");
+        assert!(!sddl.contains(&format!("FA;;;{who}")), "{sddl}");
     }
 
     #[test]
